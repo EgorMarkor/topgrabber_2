@@ -418,6 +418,14 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
 async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
+    existing = user_clients.pop(user_id, None)
+    if existing:
+        try:
+            if 'task' in existing:
+                existing['task'].cancel()
+            await existing['client'].disconnect()
+        except Exception:
+            logging.exception("Failed to disconnect previous session")
     saved = user_data.get(str(user_id))
     if saved:
         session_name = f"session_{user_id}"
