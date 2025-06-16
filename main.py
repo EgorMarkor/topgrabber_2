@@ -180,6 +180,7 @@ async def process_code(message: types.Message, state: FSMContext):
         await AuthStates.waiting_password.set()
         return
     await message.answer("✅ Аккаунт привязан!", reply_markup=main_menu_keyboard())
+    await setup_client(uid)
     await state.finish()
 
 @dp.message_handler(state=AuthStates.waiting_password)
@@ -192,6 +193,7 @@ async def process_password(message: types.Message, state: FSMContext):
         await message.reply("❌ Неверный пароль. Попробуйте ещё раз:")
         return
     await message.answer("✅ Пароль принят! Аккаунт привязан.", reply_markup=main_menu_keyboard())
+    await setup_client(uid)
     await state.finish()
 
     
@@ -314,6 +316,7 @@ async def setup_client(user_id_str: str):
     client = TelegramClient(session, data['api_id'], data['api_hash'])
     await client.start()
     data['client'] = client
+    user_clients[user_id_str] = client
     chats = data.get('chats', [])
     keywords = data.get('keywords', [])
     @client.on(events.NewMessage(chats=chats))
@@ -352,11 +355,7 @@ async def on_startup(dp):
     # Восстанавливаем Telethon-клиентов для всех привязанных пользователей
     for uid, data in user_data.items():
         if all(k in data for k in ('api_id', 'api_hash', 'chats', 'keywords')):
-            session = f"session_{uid}"
-            client = TelegramClient(session, data['api_id'], data['api_hash'])
-            await client.start()
-            user_clients[uid] = client
-            # здесь настройка событий монитора сообщений
+            await setup_client(uid)
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
