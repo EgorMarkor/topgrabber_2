@@ -344,7 +344,11 @@ async def cb_send_csv(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data.startswith('edit_'))
+# Handler for callbacks like "edit_1" which allow choosing what to edit for a
+# specific parser. More specific callbacks such as ``edit_chats_X`` and
+# ``edit_keywords_X`` are handled separately below, so here we ensure that the
+# data matches exactly the ``edit_<number>`` pattern.
+@dp.callback_query_handler(lambda c: c.data.startswith('edit_') and c.data.count('_') == 1)
 async def cb_edit_parser(call: types.CallbackQuery):
     idx = int(call.data.split('_')[1]) - 1
     kb = types.InlineKeyboardMarkup(row_width=1)
