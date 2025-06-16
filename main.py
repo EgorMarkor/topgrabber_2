@@ -27,7 +27,10 @@ storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
 # Хранилище Telethon-клиентов и данных по пользователям
-user_clients = {}  # runtime data: {user_id: {"client": TelegramClient, "phone": str, "phone_hash": str, "chats": list, "keywords": list}}
+user_clients = {}  # runtime data: {user_id: {"client": TelegramClient,
+# "phone": str, "phone_hash": str,
+# "parsers": list,  # each item {'chats': list, 'keywords': list}
+# "task": asyncio.Task}}
 
 DATA_FILE = "user_data.json"
 
@@ -76,17 +79,17 @@ HELP_TEXT = (
 )
 
 
-async def start_monitor(user_id: int):
+async def start_monitor(user_id: int, parser: dict):
     info = user_clients.get(user_id)
     if not info:
         return
     client = info['client']
-    chat_ids = info.get('chats')
-    keywords = info.get('keywords')
+    chat_ids = parser.get('chats')
+    keywords = parser.get('keywords')
     if not chat_ids or not keywords:
         return
 
-    async def monitor(event):
+    async def monitor(event, keywords=keywords):
         sender = await event.get_sender()
         if getattr(sender, 'bot', False):
             return
@@ -118,7 +121,8 @@ async def start_monitor(user_id: int):
     client.add_event_handler(monitor, events.NewMessage(chats=chat_ids))
     if not client.is_connected():
         await client.connect()
-    asyncio.create_task(client.run_until_disconnected())
+    if 'task' not in info:
+        info['task'] = asyncio.create_task(client.run_until_disconnected())
 
 # Определение состояний FSM
 class AuthStates(StatesGroup):
@@ -135,13 +139,19 @@ class PromoStates(StatesGroup):
     waiting_promo = State()
 
 
+class ParserStates(StatesGroup):
+    waiting_chats = State()
+    waiting_keywords = State()
+
+
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: types.Message):
     await message.answer(
         "Данный бот отслеживает ключевые слова в указанных чатах.\n"
         "/start - начать или восстановить работу\n"
         "/login - принудительно начать авторизацию заново\n"
-        "/info - показать текущие сохранённые настройки"
+        "/info - показать текущие сохранённые настройки\n"
+        "/addparser - добавить ещё один парсер"
     )
 
 
@@ -151,11 +161,16 @@ async def cmd_info(message: types.Message):
     if not data:
         await message.answer("Нет сохранённых данных.")
         return
-    chats = data.get('chats') or []
-    keywords = data.get('keywords') or []
-    await message.answer(
-        f"Чаты: {chats}\nКлючевые слова: {', '.join(keywords)}"
-    )
+    parsers = data.get('parsers') or []
+    if not parsers:
+        await message.answer("Парсеры не настроены.")
+        return
+    lines = []
+    for idx, p in enumerate(parsers, 1):
+        chats = p.get('chats') or []
+        kws = p.get('keywords') or []
+        lines.append(f"#{idx} Чаты: {chats}\nКлючевые слова: {', '.join(kws)}")
+    await message.answer("\n\n".join(lines))
 
 
 @dp.message_handler(commands=['start'], state="*")
@@ -235,9 +250,44 @@ async def cb_info(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == 'active_parsers')
 async def cb_active_parsers(call: types.CallbackQuery):
-    await call.message.answer(
-        "Просмотр и редактирование активных парсеров пока в разработке.")
+    data = user_data.get(str(call.from_user.id))
+    if not data or not data.get('parsers'):
+        await call.message.answer("Парсеры не настроены.")
+    else:
+        lines = []
+        for idx, p in enumerate(data.get('parsers'), 1):
+            lines.append(f"#{idx} Чаты: {p.get('chats')}\nКлючевые слова: {', '.join(p.get('keywords', []))}")
+        await call.message.answer("\n\n".join(lines))
     await call.answer()
+
+
+@dp.message_handler(commands=['addparser'], state='*')
+async def cmd_add_parser(message: types.Message, state: FSMContext):
+    await state.finish()
+    user_id = message.from_user.id
+    info = user_clients.get(user_id)
+    if not info:
+        saved = user_data.get(str(user_id))
+        if not saved:
+            await message.answer("Сначала авторизуйтесь командой /login")
+            return
+        session_name = f"session_{user_id}"
+        client = TelegramClient(session_name, saved['api_id'], saved['api_hash'])
+        await client.connect()
+        if not await client.is_user_authorized():
+            await message.answer("Сессия найдена, но требует входа. Используйте /login")
+            return
+        user_clients[user_id] = {
+            'client': client,
+            'phone': saved.get('phone'),
+            'phone_hash': '',
+            'parsers': saved.get('parsers', [])
+        }
+        for p in user_clients[user_id]['parsers']:
+            await start_monitor(user_id, p)
+
+    await message.answer("Укажите ссылки на чаты или каналы (через пробел или запятую):")
+    await ParserStates.waiting_chats.set()
 
 @dp.message_handler(commands=['login'], state="*")
 async def start_login(message: types.Message, state: FSMContext):
@@ -253,12 +303,12 @@ async def start_login(message: types.Message, state: FSMContext):
                 'client': client,
                 'phone': saved.get('phone'),
                 'phone_hash': '',
-                'chats': saved.get('chats'),
-                'keywords': saved.get('keywords')
+                'parsers': saved.get('parsers', [])
             }
-            if saved.get('chats') and saved.get('keywords'):
-                await start_monitor(user_id)
-                await message.answer("✅ Найдены сохранённые настройки. Мониторинг запущен.")
+            for p in user_clients[user_id]['parsers']:
+                await start_monitor(user_id, p)
+            if user_clients[user_id]['parsers']:
+                await message.answer("✅ Найдены сохранённые парсеры. Мониторинг запущен.")
                 return
         await message.answer("👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:", parse_mode="Markdown")
     else:
@@ -321,15 +371,13 @@ async def get_phone(message: types.Message, state: FSMContext):
         'client': client,
         'phone': phone,
         'phone_hash': phone_hash,
-        'chats': None,
-        'keywords': None
+        'parsers': []
     }
     user_data[str(user_id)] = {
         'api_id': api_id,
         'api_hash': api_hash,
         'phone': phone,
-        'chats': None,
-        'keywords': None
+        'parsers': []
     }
     save_user_data(user_data)
     await state.update_data(phone=phone)
@@ -383,7 +431,7 @@ async def get_code(message: types.Message, state: FSMContext):
         " Примеры: `https://t.me/username` или `t.me/username`. Через пробел или запятую:",
         parse_mode="Markdown"
     )
-    await AuthStates.waiting_chats.set()
+    await ParserStates.waiting_chats.set()
 
 @dp.message_handler(state=AuthStates.waiting_password)
 async def get_password(message: types.Message, state: FSMContext):
@@ -408,10 +456,9 @@ async def get_password(message: types.Message, state: FSMContext):
         "✅ Пароль принят! Теперь укажите *ссылки* на чаты или каналы для мониторинга (через пробел или запятую):",
         parse_mode="Markdown"
     )
-    await AuthStates.waiting_chats.set()
+    await ParserStates.waiting_chats.set()
 
-@dp.message_handler(state=AuthStates.waiting_chats)
-async def get_chats(message: types.Message, state: FSMContext):
+async def _process_chats(message: types.Message, state: FSMContext, next_state):
     text = message.text.strip().replace(',', ' ')
     parts = [p for p in text.split() if p]
     user_id = message.from_user.id
@@ -420,7 +467,6 @@ async def get_chats(message: types.Message, state: FSMContext):
 
     for part in parts:
         try:
-            # Попытка получить сущность по ссылке или username
             entity = await client.get_entity(part)
             chat_ids.append(entity.id)
         except Exception:
@@ -428,39 +474,62 @@ async def get_chats(message: types.Message, state: FSMContext):
                 chat_ids.append(int(part))
             else:
                 await message.answer(
-                    "⚠️ Чат не найден. Проверьте доступность в аккаунте и корректность ссылки." )
-                return
+                    "⚠️ Чат не найден. Проверьте доступность в аккаунте и корректность ссылки.")
+                return None
 
     if not chat_ids:
         await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
-        return
+        return None
 
-    user_clients[user_id]['chats'] = chat_ids
     await state.update_data(chat_ids=chat_ids)
-    if str(user_id) in user_data:
-        user_data[str(user_id)]['chats'] = chat_ids
-        save_user_data(user_data)
-
     await message.answer("Отлично! Теперь введите ключевые слова для мониторинга (через запятую):")
-    await AuthStates.waiting_keywords.set()
+    await next_state.set()
+    return chat_ids
 
-@dp.message_handler(state=AuthStates.waiting_keywords)
-async def get_keywords(message: types.Message, state: FSMContext):
+
+@dp.message_handler(state=AuthStates.waiting_chats)
+async def get_chats_auth(message: types.Message, state: FSMContext):
+    await _process_chats(message, state, AuthStates.waiting_keywords)
+
+
+@dp.message_handler(state=ParserStates.waiting_chats)
+async def get_chats_parser(message: types.Message, state: FSMContext):
+    await _process_chats(message, state, ParserStates.waiting_keywords)
+
+async def _process_keywords(message: types.Message, state: FSMContext):
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
     if not keywords:
         await message.answer("⚠️ Список пуст. Введите хотя бы одно слово:")
         return
 
     user_id = message.from_user.id
-    user_clients[user_id]['keywords'] = keywords
+    data = await state.get_data()
+    chat_ids = data.get('chat_ids')
+    if not chat_ids:
+        await message.answer("⚠️ Сначала укажите чаты.")
+        return
+
+    parser = {'chats': chat_ids, 'keywords': keywords}
+    info = user_clients.setdefault(user_id, {})
+    info.setdefault('parsers', []).append(parser)
     if str(user_id) in user_data:
-        user_data[str(user_id)]['keywords'] = keywords
+        user_data[str(user_id)].setdefault('parsers', []).append(parser)
         save_user_data(user_data)
 
-    await start_monitor(user_id)
+    await start_monitor(user_id, parser)
 
     await message.answer("✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
     await state.finish()
+
+
+@dp.message_handler(state=AuthStates.waiting_keywords)
+async def get_keywords_auth(message: types.Message, state: FSMContext):
+    await _process_keywords(message, state)
+
+
+@dp.message_handler(state=ParserStates.waiting_keywords)
+async def get_keywords_parser(message: types.Message, state: FSMContext):
+    await _process_keywords(message, state)
 
 if __name__ == '__main__':
     print("Bot is starting...")
