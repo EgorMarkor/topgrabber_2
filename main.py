@@ -51,6 +51,30 @@ def save_user_data(data):
 
 user_data = load_user_data()  # persistent data: {str(user_id): {...}}
 
+# Текст для информационного сообщения
+INFO_TEXT = (
+    "TopGrabber – это сервис для автоматического поиска потенциальных клиентов"
+    " в чатах Telegram. Вы можете настроить параметры поиска, указав нужные "
+    "ключевые слова и ссылки на чаты, в которых хотите искать клиентов. Наш бот"
+    " уведомит вас о найденных подходящих сообщениях.\n"
+    "Инструкция к боту (https://dzen.ru/a/ZuHH1h_M5kqcam1A)\n"
+    "Бот для получения сообщений (https://t.me/TOPGrabber_bot)\n\n"
+    "Минимальное количество чатов - 5шт\n"
+    "Цена:\n1 990₽/ 30 дней\n"
+    "Купить 1 дополнительный чат:\n490₽/ 30 дней\n\n"
+    "Copyright © 2024 TOPGrabberbot — AI-Парсер сообщений | "
+    "ИП Антуфьев Б.В. (https://telegra.ph/Rekvizity-08-20-2) "
+    "ОГРН 304770000133140 ИНН 026408848802 | "
+    "Публичная оферта (https://telegra.ph/Publichnaya-oferta-09-11)"
+)
+
+# Текст для помощи
+HELP_TEXT = (
+    "Если возникли вопросы, изучите Инструкцию к боту "
+    "(https://dzen.ru/a/ZuHH1h_M5kqcam1A) или напишите в поддержку: "
+    "https://t.me/+PqfIWqHquts4YjQy"
+)
+
 
 async def start_monitor(user_id: int):
     info = user_clients.get(user_id)
@@ -107,6 +131,10 @@ class AuthStates(StatesGroup):
     waiting_keywords = State()
 
 
+class PromoStates(StatesGroup):
+    waiting_promo = State()
+
+
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: types.Message):
     await message.answer(
@@ -129,7 +157,89 @@ async def cmd_info(message: types.Message):
         f"Чаты: {chats}\nКлючевые слова: {', '.join(keywords)}"
     )
 
-@dp.message_handler(commands=['start', 'login'], state="*")
+
+@dp.message_handler(commands=['start'], state="*")
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    text = (
+        "Привет! Добро пожаловать в TopGrabber — ваш инструмент для поиска "
+        "горячих и теплых клиентов в чатах Telegram. Мы поможем вам находить "
+        "нужную аудиторию и увеличивать ваши продажи.\n\n"
+        "Инструкция к боту (https://dzen.ru/a/ZuHH1h_M5kqcam1A)"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("Тариф PRO", callback_data="tariff_pro"),
+        types.InlineKeyboardButton("Результат", callback_data="result"),
+        types.InlineKeyboardButton("Помощь", callback_data="help_info"),
+        types.InlineKeyboardButton("Информация", callback_data="info"),
+        types.InlineKeyboardButton(
+            "Просмотр активных парсеров", callback_data="active_parsers"
+        ),
+    )
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
+async def cb_tariff_pro(call: types.CallbackQuery):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("Пропустить")
+    await call.message.answer(
+        "Введите промокод или нажмите 'Пропустить'.",
+        reply_markup=markup,
+    )
+    await PromoStates.waiting_promo.set()
+    await call.answer()
+
+
+@dp.message_handler(state=PromoStates.waiting_promo)
+async def promo_entered(message: types.Message, state: FSMContext):
+    code = message.text.strip()
+    if code.lower() == 'пропустить' or not code:
+        await message.answer(
+            "Промокод пропущен. Переходим к настройке тарифа PRO.",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+    elif code.upper() == 'DEMO':
+        await message.answer(
+            "Промокод принят! Вам предоставлено 7 дней бесплатного тарифа PRO.",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+    else:
+        await message.answer(
+            "Промокод не действителен. Переходим к оплате (плейсхолдер).",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+    await state.finish()
+    await start_login(message, state)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'result')
+async def cb_result(call: types.CallbackQuery):
+    await call.message.answer(
+        "Функция выдачи результатов в CSV находится в разработке.")
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'help_info')
+async def cb_help(call: types.CallbackQuery):
+    await call.message.answer(HELP_TEXT)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'info')
+async def cb_info(call: types.CallbackQuery):
+    await call.message.answer(INFO_TEXT)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'active_parsers')
+async def cb_active_parsers(call: types.CallbackQuery):
+    await call.message.answer(
+        "Просмотр и редактирование активных парсеров пока в разработке.")
+    await call.answer()
+
+@dp.message_handler(commands=['login'], state="*")
 async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
