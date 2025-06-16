@@ -233,7 +233,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 
 @dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
-async def cb_tariff_pro(call: types.CallbackQuery):
+async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    if user_id in user_clients or str(user_id) in user_data:
+        await call.answer()
+        await cmd_add_parser(call.message, state)
+        return
+
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("Пропустить")
     await call.message.answer(
