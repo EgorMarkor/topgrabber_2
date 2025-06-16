@@ -342,8 +342,20 @@ async def setup_client(user_id_str: str):
     @client.on(events.NewMessage(chats=chats))
     async def monitor(event):
         sender = await event.get_sender()
+        # Ignore messages sent by bots
         if sender and getattr(sender, 'bot', False):
             return
+
+        # If the message is forwarded, also check the original sender
+        fwd = getattr(event.message, 'forward', None)
+        if fwd:
+            try:
+                fwd_sender = await fwd.get_sender()
+            except Exception:
+                fwd_sender = None
+            if fwd_sender and getattr(fwd_sender, 'bot', False):
+                return
+
         text = event.raw_text or ''
         words = normalized_words(text)
         for kw in keywords:
@@ -353,7 +365,10 @@ async def setup_client(user_id_str: str):
                     msg_link = f"https://t.me/{chat.username}/{event.message.id}"
                 else:
                     msg_link = f"tg://openmessage?user_id={event.message.peer_id.user_id or chat.id}"
-                uname = sender.username or str(sender.id)
+                uname = (
+                    getattr(sender, 'username', None)
+                    or (str(sender.id) if sender else 'unknown')
+                )
                 dt = event.message.date.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 rec = {'Message Link': msg_link, 'Username': uname, 'DateTime': dt, 'Promo Word': kw, 'Message': text}
                 data.setdefault('matches', []).append(rec)
