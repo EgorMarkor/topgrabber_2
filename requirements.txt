@@ -1,0 +1,6 @@
+aiogram
+telethon
+pandas
+openpyxl
+snowballstemmer
+pymorphy3

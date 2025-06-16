@@ -8,6 +8,8 @@ from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+import snowballstemmer
+import pymorphy3
 from telethon import TelegramClient, events
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -19,6 +21,10 @@ from telethon.errors import (
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
+
+# Анализаторы слов для разных языков
+morph_ru = pymorphy3.MorphAnalyzer()
+stemmer_en = snowballstemmer.stemmer('english')
 
 # Телеграм-бот
 bot = Bot(token="7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE")
@@ -48,6 +54,20 @@ def save_data():
         serializable[uid] = filtered
     with open(DATA_FILE, 'w', encoding='utf-8') as f:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
+
+# Нормализация слов для разных языков
+def normalize_word(word: str) -> str:
+    word = word.lower()
+    if re.search('[а-яА-Я]', word):
+        # Русские слова приводим к начальной форме
+        return morph_ru.normal_forms(word)[0]
+    # Для остальных языков используем английский стеммер
+    return stemmer_en.stemWord(word)
+
+# Возвращает список нормализованных слов из текста
+def normalized_words(text: str):
+    words = re.findall(r"\b\w+\b", text.lower())
+    return [normalize_word(w) for w in words]
 
 # FSM-состояния
 class AuthStates(StatesGroup):
@@ -322,9 +342,9 @@ async def setup_client(user_id_str: str):
         if sender and getattr(sender, 'bot', False):
             return
         text = event.raw_text or ''
-        lowered = re.sub(r"[^\w\s]", ' ', text.lower())
+        words = normalized_words(text)
         for kw in keywords:
-            if re.search(rf"(?<!\w){re.escape(kw)}(?!\w)", lowered):
+            if normalize_word(kw) in words:
                 chat = await event.get_chat()
                 if hasattr(chat, 'username') and chat.username:
                     msg_link = f"https://t.me/{chat.username}/{event.message.id}"
