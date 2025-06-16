@@ -3,6 +3,7 @@ import asyncio
 import logging
 import json
 import os
+import html
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -78,15 +79,15 @@ async def start_monitor(user_id: int):
                 chat_username = getattr(chat, 'username', None)
                 if chat_username:
                     link = f"https://t.me/{chat_username}/{event.id}"
-                preview = text[:400]
+                preview = html.escape(text[:400])
                 await bot.send_message(
                     user_id,
-                    f"🔔 Найдено '{kw}' в чате '{title}'\n"
-                    f"Username: {sender_name}\n"
+                    f"🔔 Найдено '{html.escape(kw)}' в чате '{html.escape(title)}'\n"
+                    f"Username: {html.escape(sender_name)}\n"
                     f"DateTime: {msg_time}\n"
-                    f"Link: {link}\n"
-                    f"```{preview}```",
-                    parse_mode="Markdown",
+                    f"Link: {html.escape(link)}\n"
+                    f"<pre>{preview}</pre>",
+                    parse_mode="HTML",
                 )
                 break
 
