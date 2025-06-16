@@ -1,6 +1,4 @@
 import re
-import os
-import json
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
@@ -8,8 +6,6 @@ from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
-import snowballstemmer
-import pymorphy3
 from telethon import TelegramClient, events
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -22,377 +18,234 @@ from telethon.errors import (
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Анализаторы слов для разных языков
-morph_ru = pymorphy3.MorphAnalyzer()
-stemmer_en = snowballstemmer.stemmer('english')
-
-# Телеграм-бот
-bot = Bot(token="7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE")
+API_TOKEN = "7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE"
+bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# Хранилище активных Telethon клиентов (не сериализуется)
-user_clients = {}  # {user_id_str: TelegramClient}
+# Хранилище Telethon-клиентов и данных по пользователям
+user_clients = {}  # {user_id: {"client": TelegramClient, "phone": str, "phone_hash": str, "chats": list, "keywords": list}}
 
-# Файл для хранения пользовательских настроек
-DATA_FILE = 'users.json'
-try:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            user_data = json.load(f)
-    else:
-        user_data = {}
-except (json.JSONDecodeError, ValueError):
-    logging.warning(f"Не удалось разобрать {DATA_FILE}, начинаем с пустых данных")
-    user_data = {}
-
-# Вспомогательная функция для сохранения (исключаем client)
-def save_data():
-    serializable = {}
-    for uid, data in user_data.items():
-        filtered = {k: v for k, v in data.items() if k != 'client'}
-        serializable[uid] = filtered
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(serializable, f, ensure_ascii=False, indent=2)
-
-# Нормализация слов для разных языков
-def normalize_word(word: str) -> str:
-    word = word.lower()
-    if re.search('[а-яА-Я]', word):
-        # Русские слова приводим к начальной форме
-        return morph_ru.normal_forms(word)[0]
-    # Для остальных языков используем английский стеммер
-    return stemmer_en.stemWord(word)
-
-# Возвращает список нормализованных слов из текста
-def normalized_words(text: str):
-    words = re.findall(r"\b\w+\b", text.lower())
-    return [normalize_word(w) for w in words]
-
-# FSM-состояния
+# Определение состояний FSM
 class AuthStates(StatesGroup):
     waiting_api_id = State()
     waiting_api_hash = State()
     waiting_phone = State()
     waiting_code = State()
     waiting_password = State()
-    waiting_add_chats = State()
-    waiting_add_keywords = State()
-    waiting_promo_code = State()
-    waiting_promo_input = State()
+    waiting_chats = State()
+    waiting_keywords = State()
 
-# Клавиатура главного меню
-def main_menu_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton('Помощь', callback_data='help'),
-        types.InlineKeyboardButton('Информация', callback_data='info'),
-        types.InlineKeyboardButton('Добавить чаты', callback_data='add_chats'),
-        types.InlineKeyboardButton('Добавить слова', callback_data='add_keywords'),
-        types.InlineKeyboardButton('Результаты', callback_data='results'),
-        types.InlineKeyboardButton('Тариф Pro', callback_data='pro')
-    )
-    return kb
-
-# ------------------------- /start -------------------------
-@dp.message_handler(commands=['start'], state='*')
-async def cmd_start(message: types.Message, state: FSMContext):
+@dp.message_handler(commands=['start', 'login'], state="*")
+async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
-    text = (
-        "👋 Привет! Добро пожаловать в TopGrabber — ваш инструмент для поиска горячих и теплых клиентов в чатах Telegram. Мы поможем вам находить нужную аудиторию и увеличивать ваши продажи.\n\n"
-        "<a href=\"https://dzen.ru/a/ZuHH1h_M5kqcam1A\">Инструкция к боту</a>"
+    await message.answer(
+        "👋 Привет! Для начала работы введите свой *api_id* Telegram:",
+        parse_mode="Markdown"
     )
-    await message.answer(text, reply_markup=main_menu_keyboard(), parse_mode="HTML")
+    await AuthStates.waiting_api_id.set()
 
-# ------------------------- Оформление Pro (с привязкой) -------------------------
-@dp.callback_query_handler(lambda c: c.data == 'pro')
-async def callback_pro(c: types.CallbackQuery):
-    uid = str(c.from_user.id)
-    if uid not in user_data or 'api_id' not in user_data[uid]:
-        await c.message.answer(
-            "Для оформления тарифа Pro нужно сначала привязать Telegram-аккаунт.\n"
-            "Введите ваш api_id (число):"
-        )
-        await AuthStates.waiting_api_id.set()
-    else:
-        await c.message.answer(
-            "Тариф Pro: 1990₽ за 30 дней (5 чатов).\nУ вас есть промокод? (да/нет)"
-        )
-        await AuthStates.waiting_promo_code.set()
-    await c.answer()
-
-# ------------------------- Привязка аккаунта -------------------------
 @dp.message_handler(state=AuthStates.waiting_api_id)
-async def process_api_id(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.reply("❗ api_id должен быть числом. Попробуйте ещё раз:")
+async def get_api_id(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("❗ *api_id* должен быть числом. Попробуйте ещё раз:", parse_mode="Markdown")
         return
-    await state.update_data(api_id=int(message.text))
-    await message.answer("Введите api_hash вашего приложения:")
+    await state.update_data(api_id=int(text))
+    await message.answer("Отлично. Введите *api_hash* вашего приложения:", parse_mode="Markdown")
     await AuthStates.waiting_api_hash.set()
 
 @dp.message_handler(state=AuthStates.waiting_api_hash)
-async def process_api_hash(message: types.Message, state: FSMContext):
+async def get_api_hash(message: types.Message, state: FSMContext):
     api_hash = message.text.strip()
-    if not api_hash:
-        await message.reply("❗ api_hash не может быть пустым. Попробуйте ещё раз:")
+    if not api_hash or len(api_hash) < 5:
+        await message.answer("❗ *api_hash* должен быть корректной строкой. Попробуйте ещё раз:", parse_mode="Markdown")
         return
     await state.update_data(api_hash=api_hash)
     await message.answer(
-        "Теперь введите номер телефона (с кодом страны, например +79991234567):"
+        "Теперь введите номер телефона Telegram (с международным кодом, например +79991234567):"
     )
     await AuthStates.waiting_phone.set()
 
 @dp.message_handler(state=AuthStates.waiting_phone)
-async def process_phone(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    api_id = data['api_id']
-    api_hash = data['api_hash']
+async def get_phone(message: types.Message, state: FSMContext):
     phone = message.text.strip()
-    session = f"session_{message.from_user.id}"
-    client = TelegramClient(session, api_id, api_hash)
+    data = await state.get_data()
+    api_id = data.get('api_id')
+    api_hash = data.get('api_hash')
+    user_id = message.from_user.id
+    session_name = f"session_{user_id}"
+
     try:
+        client = TelegramClient(session_name, api_id, api_hash)
         await client.connect()
-        res = await client.send_code_request(phone)
+        result = await client.send_code_request(phone)
+        phone_hash = result.phone_code_hash
     except PhoneNumberInvalidError:
-        await message.reply("❗ Неверный номер телефона. Попробуйте ещё раз:")
+        await message.answer("❌ Неверный номер телефона. Введите заново:")
         return
     except FloodWaitError as e:
-        await message.reply(f"⚠️ Подождите {e.seconds} секунд.")
+        await message.answer(f"⚠️ Telegram просит подождать {e.seconds} секунд перед следующей попыткой.")
         await state.finish()
         return
     except Exception as e:
         logging.exception(e)
-        await message.reply("⚠️ Ошибка при отправке кода. Попробуйте позже.")
+        await message.answer(f"⚠️ Ошибка при запросе кода: {e}. Попробуйте /start.")
         await state.finish()
         return
-    uid = str(message.from_user.id)
-    # Сохраняем данные без client
-    user_data.setdefault(uid, {}).update({
-        'api_id': api_id,
-        'api_hash': api_hash,
+
+    user_clients[user_id] = {
+        'client': client,
         'phone': phone,
-        'phone_hash': res.phone_code_hash
-    })
-    # Client хранится отдельно
-    user_clients[uid] = client
-    save_data()
-    await message.answer("📱 Код отправлен! Введите код (только цифры):")
+        'phone_hash': phone_hash,
+        'chats': None,
+        'keywords': None
+    }
+    await state.update_data(phone=phone)
+
+    await message.answer(
+        "📱 Код отправлен! Пожалуйста, введите код, *вставляя любые символы* (например, пробелы или дефисы) между цифрами."
+        " Я автоматически уберу лишние символы.",
+        parse_mode="Markdown"
+    )
     await AuthStates.waiting_code.set()
 
 @dp.message_handler(state=AuthStates.waiting_code)
-async def process_code(message: types.Message, state: FSMContext):
-    uid = str(message.from_user.id)
-    code = re.sub(r"\D", '', message.text)
-    client = user_clients.get(uid)
-    usr = user_data.get(uid, {})
+async def get_code(message: types.Message, state: FSMContext):
+    raw = message.text.strip()
+    code = re.sub(r'\D', '', raw)
+    user_id = message.from_user.id
+    client_info = user_clients.get(user_id)
+
+    if not client_info:
+        await message.answer("⚠️ Сессия не найдена. Начните сначала /start.")
+        await state.finish()
+        return
+
+    client = client_info['client']
+    phone = client_info['phone']
+    phone_hash = client_info['phone_hash']
+
     try:
-        await client.sign_in(code=code, phone=usr['phone'], phone_code_hash=usr['phone_hash'])
+        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_hash)
     except PhoneCodeInvalidError:
-        await message.reply("❌ Неверный код. Попробуйте ещё раз:")
+        await message.answer("❌ Неверный код. Попробуйте снова, вставив символы между цифрами:")
         return
     except PhoneCodeExpiredError:
-        await message.reply("❌ Код истёк. Начните заново /start.")
+        await message.answer(
+            "❌ Код истёк. Пожалуйста, перезапустите авторизацию командой /start и запросите новый код."
+        )
         await state.finish()
         return
     except SessionPasswordNeededError:
-        await message.answer("🔒 Аккаунт защищён паролем. Введите пароль:")
+        await message.answer("🔒 Ваш аккаунт защищён паролем. Введите пароль:")
         await AuthStates.waiting_password.set()
         return
-    await message.answer("✅ Аккаунт привязан!", reply_markup=main_menu_keyboard())
-    await setup_client(uid)
-    await state.finish()
+    except Exception as e:
+        logging.exception(e)
+        await message.answer(f"⚠️ Ошибка при входе: {e}. Попробуйте /start.")
+        await state.finish()
+        return
+
+    await message.answer(
+        "✅ Вы успешно вошли! Теперь укажите *ссылки* на чаты или каналы для мониторинга."
+        " Примеры: `https://t.me/username` или `t.me/username`. Через пробел или запятую:",
+        parse_mode="Markdown"
+    )
+    await AuthStates.waiting_chats.set()
 
 @dp.message_handler(state=AuthStates.waiting_password)
-async def process_password(message: types.Message, state: FSMContext):
-    uid = str(message.from_user.id)
-    client = user_clients.get(uid)
-    try:
-        await client.sign_in(password=message.text.strip())
-    except Exception:
-        await message.reply("❌ Неверный пароль. Попробуйте ещё раз:")
-        return
-    await message.answer("✅ Пароль принят! Аккаунт привязан.", reply_markup=main_menu_keyboard())
-    await setup_client(uid)
-    await state.finish()
+async def get_password(message: types.Message, state: FSMContext):
+    password = message.text.strip()
+    user_id = message.from_user.id
+    client_info = user_clients.get(user_id)
 
-    
-# ------------------------- CALLBACKS -------------------------
-@dp.callback_query_handler(lambda c: c.data == 'help')
-async def callback_help(c: types.CallbackQuery):
-    text = (
-        "Если возникли вопросы, смотрите Инструкцию или пишите в поддержку: https://t.me/ihxY6kUFLe1kNmQy"
-    )
-    await c.message.answer(text)
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == 'info')
-async def callback_info(c: types.CallbackQuery):
-    text = (
-        "TopGrabber — сервис поиска клиентов в Telegram."
-        " Минимум 5 чатов, цена 1990₽/30д, доп. чат 490₽/30д.\n"
-        "© 2025 TOPGrabberbot | ИП Антюфьев Б.В."
-    )
-    await c.message.answer(text)
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == 'add_chats')
-async def callback_add_chats(c: types.CallbackQuery):
-    await c.message.answer(
-        "Введите ссылки или ID чатов через пробел или запятую:\n"
-        "Пример: @username -1001234567890 https://t.me/example"
-    )
-    await AuthStates.waiting_add_chats.set()
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == 'add_keywords')
-async def callback_add_keywords(c: types.CallbackQuery):
-    await c.message.answer("Введите ключевые слова через запятую (напр.: продажа, маркетинг):")
-    await AuthStates.waiting_add_keywords.set()
-    await c.answer()
-
-@dp.callback_query_handler(lambda c: c.data == 'results')
-async def callback_results(c: types.CallbackQuery):
-    user_id = str(c.from_user.id)
-    matches = user_data.get(user_id, {}).get('matches', [])
-    if not matches:
-        await c.message.answer("ℹ️ Результатов пока нет.")
-    else:
-        import pandas as pd
-        df = pd.DataFrame(matches)
-        path = f"results_{user_id}.xlsx"
-        df.to_excel(path, index=False)
-        await c.message.answer_document(
-            types.InputFile(path), caption="Ссылка на AlertBot: @alert_bot"
-        )
-    await c.answer()
-
-# ------------------------- Добавление чатов -------------------------
-@dp.message_handler(state=AuthStates.waiting_add_chats)
-async def process_add_chats(message: types.Message, state: FSMContext):
-    parts = re.split(r"[\s,]+", message.text.strip())
-    new_ids = []
-    client = user_data[str(message.from_user.id)].get('client')
-    for part in parts:
-        if not part: continue
-        if part.isdigit() or (part.startswith('-') and part[1:].isdigit()):
-            new_ids.append(int(part))
-        else:
-            try:
-                ent = await client.get_entity(part)
-                new_ids.append(ent.id)
-            except:
-                await message.reply(
-                    "⚠️ Чат не найден. Проверьте, что он есть в вашем аккаунте или ссылка корректна, затем повторите ввод:"
-                )
-                return
-    usr = user_data[str(message.from_user.id)]
-    usr.setdefault('chats', [])
-    for cid in new_ids:
-        if cid not in usr['chats']:
-            usr['chats'].append(cid)
-    save_data()
-    await message.reply("✅ Чаты добавлены.")
-    await state.finish()
-
-# ------------------------- Добавление ключевых слов -------------------------
-@dp.message_handler(state=AuthStates.waiting_add_keywords)
-async def process_add_keywords(message: types.Message, state: FSMContext):
-    kws = [w.strip().lower() for w in message.text.split(',') if w.strip()]
-    if not kws:
-        await message.reply("⚠️ Список пуст. Повторите ввод:")
-        return
-    usr = user_data[str(message.from_user.id)]
-    usr.setdefault('keywords', [])
-    for kw in kws:
-        if kw not in usr['keywords']:
-            usr['keywords'].append(kw)
-    save_data()
-    await message.reply("✅ Слова сохранены.")
-    await state.finish()
-
-# ------------------------- Обработка промокода -------------------------
-@dp.message_handler(state=AuthStates.waiting_promo_code)
-async def process_promo_code(message: types.Message, state: FSMContext):
-    ans = message.text.strip().lower()
-    if ans in ('да', 'есть'):
-        await message.answer("Введите промокод:")
-        await AuthStates.waiting_promo_input.set()
-    else:
-        await message.answer("Отправляю счет без промокода.")
+    if not client_info:
+        await message.answer("⚠️ Сессия не найдена. Начните сначала /start.")
         await state.finish()
+        return
 
-@dp.message_handler(state=AuthStates.waiting_promo_input)
-async def process_promo_input(message: types.Message, state: FSMContext):
-    code = message.text.strip()
-    if code == 'PROMO2025':
-        await message.answer("Промокод принят! Счет отправлен со скидкой.")
-    else:
-        await message.answer("Неверный промокод. Счет без скидки отправлен.")
-    await state.finish()
+    client = client_info['client']
+    try:
+        await client.sign_in(password=password)
+    except Exception as e:
+        logging.exception(e)
+        await message.answer("❌ Неверный пароль. Попробуйте ещё раз:")
+        return
 
-# ------------------------- TELETHON MONITORING -------------------------
-async def setup_client(user_id_str: str):
-    data = user_data[user_id_str]
-    session = f"session_{user_id_str}"
-    client = TelegramClient(session, data['api_id'], data['api_hash'])
-    await client.start()
-    data['client'] = client
-    user_clients[user_id_str] = client
-    chats = data.get('chats', [])
-    keywords = data.get('keywords', [])
-    @client.on(events.NewMessage(chats=chats))
-    async def monitor(event):
-        sender = await event.get_sender()
-        # Ignore messages sent by bots
-        if sender and getattr(sender, 'bot', False):
-            return
+    await message.answer(
+        "✅ Пароль принят! Теперь укажите *ссылки* на чаты или каналы для мониторинга (через пробел или запятую):",
+        parse_mode="Markdown"
+    )
+    await AuthStates.waiting_chats.set()
 
-        # If the message is forwarded, also check the original sender
-        fwd = getattr(event.message, 'forward', None)
-        if fwd:
-            try:
-                fwd_sender = await fwd.get_sender()
-            except Exception:
-                fwd_sender = None
-            if fwd_sender and getattr(fwd_sender, 'bot', False):
+@dp.message_handler(state=AuthStates.waiting_chats)
+async def get_chats(message: types.Message, state: FSMContext):
+    text = message.text.strip().replace(',', ' ')
+    parts = [p for p in text.split() if p]
+    user_id = message.from_user.id
+    client = user_clients[user_id]['client']
+    chat_ids = []
+
+    for part in parts:
+        try:
+            # Попытка получить сущность по ссылке или username
+            entity = await client.get_entity(part)
+            chat_ids.append(entity.id)
+        except Exception:
+            # Пытаемся как ID
+            if part.isdigit():
+                chat_ids.append(int(part))
+            else:
+                await message.answer(
+                    f"⚠️ '{part}' не является корректной ссылкой или ID. Повторите ввод:" )
                 return
 
-        text = event.raw_text or ''
-        words = normalized_words(text)
-        for kw in keywords:
-            if normalize_word(kw) in words:
-                chat = await event.get_chat()
-                if hasattr(chat, 'username') and chat.username:
-                    msg_link = f"https://t.me/{chat.username}/{event.message.id}"
-                else:
-                    msg_link = f"tg://openmessage?user_id={event.message.peer_id.user_id or chat.id}"
-                uname = (
-                    getattr(sender, 'username', None)
-                    or (str(sender.id) if sender else 'unknown')
-                )
-                dt = event.message.date.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-                rec = {'Message Link': msg_link, 'Username': uname, 'DateTime': dt, 'Promo Word': kw, 'Message': text}
-                data.setdefault('matches', []).append(rec)
-                save_data()
-                await bot.send_message(int(user_id_str), f"🔔 *Найдено '{kw}'*", parse_mode="Markdown")
-                detail = (
-                    f"*Message Link:* {msg_link}\n"
-                    f"*Username:* {uname}\n"
-                    f"*DateTime:* {dt}\n"
-                    f"*Promo Word:* {kw}\n"
-                    f"*Message:* {text[:400]}"
-                )
-                await bot.send_message(int(user_id_str), detail, parse_mode="Markdown")
-                break
-    asyncio.create_task(client.run_until_disconnected())
-    
+    if not chat_ids:
+        await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
+        return
 
-async def on_startup(dp):
-    # Восстанавливаем Telethon-клиентов для всех привязанных пользователей
-    for uid, data in user_data.items():
-        if all(k in data for k in ('api_id', 'api_hash', 'chats', 'keywords')):
-            await setup_client(uid)
+    user_clients[user_id]['chats'] = chat_ids
+    await state.update_data(chat_ids=chat_ids)
+
+    await message.answer("Отлично! Теперь введите ключевые слова для мониторинга (через запятую):")
+    await AuthStates.waiting_keywords.set()
+
+@dp.message_handler(state=AuthStates.waiting_keywords)
+async def get_keywords(message: types.Message, state: FSMContext):
+    keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
+    if not keywords:
+        await message.answer("⚠️ Список пуст. Введите хотя бы одно слово:")
+        return
+
+    user_id = message.from_user.id
+    user_clients[user_id]['keywords'] = keywords
+    client = user_clients[user_id]['client']
+    chat_ids = user_clients[user_id]['chats']
+
+    @client.on(events.NewMessage(chats=chat_ids))
+    async def monitor(event):
+        text = event.raw_text or ''
+        lowered = text.lower()
+        for kw in keywords:
+            if kw in lowered:
+                chat = await event.get_chat()
+                title = getattr(chat, 'title', str(event.chat_id))
+                preview = text[:400]
+                await bot.send_message(
+                    user_id,
+                    f"🔔 Найдено '{kw}' в чате '{title}':\n```{preview}```",
+                    parse_mode="Markdown"
+                )
+                break
+
+    if not client.is_connected():
+        await client.connect()
+    asyncio.create_task(client.run_until_disconnected())
+
+    await message.answer("✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
+    await state.finish()
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
+    print("Bot is starting...")
+    executor.start_polling(dp, skip_updates=True)
