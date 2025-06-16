@@ -282,7 +282,9 @@ async def process_add_chats(message: types.Message, state: FSMContext):
                 ent = await client.get_entity(part)
                 new_ids.append(ent.id)
             except:
-                await message.reply("⚠️ Чат не найден. Повторите ввод:")
+                await message.reply(
+                    "⚠️ Чат не найден. Проверьте, что он есть в вашем аккаунте или ссылка корректна, затем повторите ввод:"
+                )
                 return
     usr = user_data[str(message.from_user.id)]
     usr.setdefault('chats', [])
