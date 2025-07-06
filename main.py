@@ -5,6 +5,7 @@ import json
 import os
 import html
 import csv
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
@@ -34,6 +35,19 @@ user_clients = {}  # runtime data: {user_id: {"client": TelegramClient,
 # "task": asyncio.Task}}
 
 DATA_FILE = "user_data.json"
+TEXT_FILE = "texts.json"
+
+with open(TEXT_FILE, "r", encoding="utf-8") as f:
+    TEXTS = json.load(f)
+
+def t(key, **kwargs):
+    text = TEXTS.get(key, key)
+    if kwargs:
+        try:
+            text = text.format(**kwargs)
+        except Exception:
+            pass
+    return text
 
 def load_user_data():
     if os.path.exists(DATA_FILE):
@@ -41,6 +55,11 @@ def load_user_data():
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for u in data.values():
+                u.setdefault('subscription_expiry', 0)
+                u.setdefault('recurring', False)
+                u.setdefault('reminder3_sent', False)
+                u.setdefault('reminder1_sent', False)
+                u.setdefault('inactive_notified', False)
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
             return data
@@ -58,6 +77,32 @@ def save_user_data(data):
 
 
 user_data = load_user_data()  # persistent data: {str(user_id): {...}}
+
+def check_subscription(user_id: int):
+    data = user_data.get(str(user_id))
+    if not data:
+        return
+    exp = data.get('subscription_expiry', 0)
+    now = int(datetime.utcnow().timestamp())
+    days_left = (exp - now) // 86400
+    if exp and days_left <= 0:
+        if not data.get('inactive_notified'):
+            # send last results and mark notified
+            asyncio.create_task(send_all_results(user_id))
+            asyncio.create_task(bot.send_message(user_id, t('subscription_inactive')))
+            data['inactive_notified'] = True
+            save_user_data(user_data)
+        return
+    if not data.get('recurring'):
+        if days_left == 3 and not data.get('reminder3_sent'):
+            asyncio.create_task(bot.send_message(user_id, t('subscription_reminder', days=3)))
+            data['reminder3_sent'] = True
+        elif days_left == 1 and not data.get('reminder1_sent'):
+            asyncio.create_task(bot.send_message(user_id, t('subscription_reminder', days=1)))
+            data['reminder1_sent'] = True
+        if data.get('reminder3_sent') or data.get('reminder1_sent'):
+            save_user_data(user_data)
+
 
 # Текст для информационного сообщения
 INFO_TEXT = (
@@ -192,6 +237,22 @@ async def cmd_help(message: types.Message):
     )
 
 
+@dp.message_handler(commands=['enable_recurring'])
+async def enable_recurring(message: types.Message):
+    data = user_data.setdefault(str(message.from_user.id), {})
+    data['recurring'] = True
+    save_user_data(user_data)
+    await message.answer(t('recurring_enabled'))
+
+
+@dp.message_handler(commands=['disable_recurring'])
+async def disable_recurring(message: types.Message):
+    data = user_data.setdefault(str(message.from_user.id), {})
+    data['recurring'] = False
+    save_user_data(user_data)
+    await message.answer(t('recurring_disabled'))
+
+
 @dp.message_handler(commands=['info'])
 async def cmd_info(message: types.Message):
     data = user_data.get(str(message.from_user.id))
@@ -213,12 +274,8 @@ async def cmd_info(message: types.Message):
 @dp.message_handler(commands=['start'], state="*")
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
-    text = (
-        "Привет! Добро пожаловать в TopGrabber — ваш инструмент для поиска "
-        "горячих и теплых клиентов в чатах Telegram. Мы поможем вам находить "
-        "нужную аудиторию и увеличивать ваши продажи.\n\n"
-        "Инструкция к боту (https://dzen.ru/a/ZuHH1h_M5kqcam1A)"
-    )
+    check_subscription(message.from_user.id)
+    text = t('welcome')
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("Тариф PRO", callback_data="tariff_pro"),
@@ -316,6 +373,7 @@ async def cb_active_parsers(call: types.CallbackQuery):
 async def cb_send_csv(call: types.CallbackQuery):
     idx = int(call.data.split('_')[1]) - 1
     user_id = call.from_user.id
+    check_subscription(user_id)
     data = user_data.get(str(user_id))
     if not data:
         await call.message.answer("Данные не найдены.")
@@ -348,6 +406,38 @@ async def cb_send_csv(call: types.CallbackQuery):
     await bot.send_document(user_id, types.InputFile(path))
     os.remove(path)
     await call.answer()
+
+
+@dp.message_handler(commands=['export'])
+async def cmd_export(message: types.Message):
+    check_subscription(message.from_user.id)
+    await send_all_results(message.from_user.id)
+
+async def send_all_results(user_id: int):
+    data = user_data.get(str(user_id))
+    if not data:
+        return
+    rows = []
+    for parser in data.get('parsers', []):
+        for r in parser.get('results', []):
+            rows.append([
+                r.get('keyword', ''),
+                r.get('chat', ''),
+                r.get('sender', ''),
+                r.get('datetime', ''),
+                r.get('link', ''),
+                r.get('text', '').replace('\n', ' '),
+            ])
+    if not rows:
+        await bot.send_message(user_id, t('no_results'))
+        return
+    path = f"results_{user_id}_all.csv"
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
+        writer.writerows(rows)
+    await bot.send_document(user_id, types.InputFile(path), caption=t('csv_export_ready'))
+    os.remove(path)
 
 
 # Handler for callbacks like "edit_1" which allow choosing what to edit for a
@@ -424,6 +514,7 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
 async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
+    check_subscription(user_id)
     existing = user_clients.pop(user_id, None)
     if existing:
         try:
@@ -506,6 +597,7 @@ async def get_phone(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
+    expiry = int((datetime.utcnow() + timedelta(days=30)).timestamp())
     user_clients[user_id] = {
         'client': client,
         'phone': phone,
@@ -516,7 +608,12 @@ async def get_phone(message: types.Message, state: FSMContext):
         'api_id': api_id,
         'api_hash': api_hash,
         'phone': phone,
-        'parsers': []
+        'parsers': [],
+        'subscription_expiry': expiry,
+        'recurring': False,
+        'reminder3_sent': False,
+        'reminder1_sent': False,
+        'inactive_notified': False
     }
     save_user_data(user_data)
     await state.update_data(phone=phone)
