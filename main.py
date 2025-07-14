@@ -19,6 +19,8 @@ from telethon.errors import (
     PhoneCodeExpiredError,
     FloodWaitError
 )
+from yookassa import Payment, Configuration
+import uuid
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +29,15 @@ API_TOKEN = "7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE"
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
+
+# ЮKassa configuration
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
+PRO_PRICE = "1990.00"
+RETURN_URL = "https://t.me/TOPGrabber_bot"
+if YOOKASSA_SHOP_ID and YOOKASSA_TOKEN:
+    Configuration.account_id = YOOKASSA_SHOP_ID
+    Configuration.secret_key = YOOKASSA_TOKEN
 
 # Хранилище Telethon-клиентов и данных по пользователям
 user_clients = {}  # runtime data: {user_id: {"client": TelegramClient,
@@ -77,6 +88,31 @@ def save_user_data(data):
 
 
 user_data = load_user_data()  # persistent data: {str(user_id): {...}}
+
+def create_pro_payment(user_id: int):
+    if not (YOOKASSA_SHOP_ID and YOOKASSA_TOKEN):
+        return None, None
+    try:
+        payment = Payment.create(
+            {
+                "amount": {"value": PRO_PRICE, "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": RETURN_URL},
+                "description": f"Подписка PRO для пользователя {user_id}",
+            },
+            str(uuid.uuid4()),
+        )
+        return payment.id, payment.confirmation.confirmation_url
+    except Exception:
+        logging.exception("Failed to create payment")
+    return None, None
+
+def check_pro_payment(payment_id: str):
+    try:
+        payment = Payment.find_one(payment_id)
+        return payment.status
+    except Exception:
+        logging.exception("Failed to check payment")
+    return None
 
 def check_subscription(user_id: int):
     data = user_data.get(str(user_id))
@@ -292,7 +328,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
 async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
-    if user_id in user_clients or str(user_id) in user_data:
+    data = user_data.get(str(user_id))
+    if data and data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
         await call.answer()
         await cmd_add_parser(call.message, state)
         return
@@ -310,23 +347,37 @@ async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
 @dp.message_handler(state=PromoStates.waiting_promo)
 async def promo_entered(message: types.Message, state: FSMContext):
     code = message.text.strip()
-    if code.lower() == 'пропустить' or not code:
-        await message.answer(
-            "Промокод пропущен. Переходим к настройке тарифа PRO.",
-            reply_markup=types.ReplyKeyboardRemove(),
-        )
-    elif code.upper() == 'DEMO':
+    user_id = message.from_user.id
+    if code.upper() == 'DEMO':
+        expiry = int((datetime.utcnow() + timedelta(days=7)).timestamp())
+        data = user_data.setdefault(str(user_id), {})
+        data['subscription_expiry'] = expiry
+        save_user_data(user_data)
         await message.answer(
             "Промокод принят! Вам предоставлено 7 дней бесплатного тарифа PRO.",
             reply_markup=types.ReplyKeyboardRemove(),
         )
+        await state.finish()
+        await message.answer("Используйте /login для авторизации.")
+        return
+
+    await message.answer(
+        "Перейдите по ссылке для оплаты тарифа PRO.",
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
+    payment_id, url = create_pro_payment(user_id)
+    if not payment_id:
+        await message.answer("Не удалось создать платёж. Попробуйте позже.")
     else:
+        user_data.setdefault(str(user_id), {})['payment_id'] = payment_id
+        save_user_data(user_data)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("Оплатить", url=url))
         await message.answer(
-            "Промокод не действителен. Переходим к оплате (плейсхолдер).",
-            reply_markup=types.ReplyKeyboardRemove(),
+            "Для активации тарифа оплатите по ссылке и затем используйте /check_payment.",
+            reply_markup=kb,
         )
     await state.finish()
-    await start_login(message, state)
 
 
 @dp.callback_query_handler(lambda c: c.data == 'result')
@@ -412,6 +463,25 @@ async def cb_send_csv(call: types.CallbackQuery):
 async def cmd_export(message: types.Message):
     check_subscription(message.from_user.id)
     await send_all_results(message.from_user.id)
+
+
+@dp.message_handler(commands=['check_payment'])
+async def cmd_check_payment(message: types.Message):
+    user_id = message.from_user.id
+    data = user_data.get(str(user_id))
+    payment_id = data.get('payment_id') if data else None
+    if not payment_id:
+        await message.answer("Платёж не найден. Используйте /tariff_pro для оформления.")
+        return
+    status = check_pro_payment(payment_id)
+    if status == 'succeeded':
+        expiry = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+        data['subscription_expiry'] = expiry
+        data.pop('payment_id', None)
+        save_user_data(user_data)
+        await message.answer("Оплата подтверждена! Используйте /login для авторизации.")
+    else:
+        await message.answer(f"Платёж не завершён. Текущий статус: {status}")
 
 async def send_all_results(user_id: int):
     data = user_data.get(str(user_id))
@@ -515,6 +585,11 @@ async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
     check_subscription(user_id)
+    data = user_data.get(str(user_id))
+    now = int(datetime.utcnow().timestamp())
+    if not data or data.get('subscription_expiry', 0) <= now:
+        await message.answer("Сначала оплатите тариф командой /tariff_pro")
+        return
     existing = user_clients.pop(user_id, None)
     if existing:
         try:
@@ -597,24 +672,25 @@ async def get_phone(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
-    expiry = int((datetime.utcnow() + timedelta(days=30)).timestamp())
     user_clients[user_id] = {
         'client': client,
         'phone': phone,
         'phone_hash': phone_hash,
         'parsers': []
     }
-    user_data[str(user_id)] = {
+    saved = user_data.get(str(user_id), {})
+    saved.update({
         'api_id': api_id,
         'api_hash': api_hash,
         'phone': phone,
-        'parsers': [],
-        'subscription_expiry': expiry,
-        'recurring': False,
-        'reminder3_sent': False,
-        'reminder1_sent': False,
-        'inactive_notified': False
-    }
+    })
+    saved.setdefault('parsers', [])
+    saved.setdefault('subscription_expiry', 0)
+    saved.setdefault('recurring', False)
+    saved.setdefault('reminder3_sent', False)
+    saved.setdefault('reminder1_sent', False)
+    saved.setdefault('inactive_notified', False)
+    user_data[str(user_id)] = saved
     save_user_data(user_data)
     await state.update_data(phone=phone)
 

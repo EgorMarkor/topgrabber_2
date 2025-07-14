@@ -4,3 +4,4 @@ pandas
 openpyxl
 snowballstemmer
 pymorphy3
+yookassa==2.3.0
