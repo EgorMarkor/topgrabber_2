@@ -20,6 +20,8 @@ from telethon.errors import (
     FloodWaitError
 )
 from yookassa import Payment, Configuration
+from pymorphy3 import MorphAnalyzer
+import snowballstemmer
 import uuid
 
 # Настройка логирования
@@ -50,6 +52,17 @@ TEXT_FILE = "texts.json"
 
 with open(TEXT_FILE, "r", encoding="utf-8") as f:
     TEXTS = json.load(f)
+
+# Morphological analysis utilities
+morph = MorphAnalyzer()
+stemmer_en = snowballstemmer.stemmer("english")
+
+def normalize_word(word: str) -> str:
+    """Return normalized form for keyword matching."""
+    word = word.lower()
+    if re.search("[а-яА-Я]", word):
+        return morph.parse(word)[0].normal_form
+    return stemmer_en.stemWord(word)
 
 def t(key, **kwargs):
     text = TEXTS.get(key, key)
@@ -182,9 +195,9 @@ async def start_monitor(user_id: int, parser: dict):
         if getattr(sender, 'bot', False):
             return
         text = event.raw_text or ''
-        words = re.findall(r'\w+', text.lower())
+        words = [normalize_word(w) for w in re.findall(r'\w+', text.lower())]
         for kw in keywords:
-            if kw.lower() in words:
+            if normalize_word(kw) in words:
                 chat = await event.get_chat()
                 title = getattr(chat, 'title', str(event.chat_id))
                 username = getattr(sender, 'username', None)
