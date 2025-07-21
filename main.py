@@ -795,7 +795,7 @@ async def _process_chats(message: types.Message, state: FSMContext, next_state):
             entity = await client.get_entity(part)
             chat_ids.append(entity.id)
         except Exception:
-            if part.isdigit():
+            if part.lstrip("-").isdigit():
                 chat_ids.append(int(part))
             else:
                 await message.answer(
@@ -871,7 +871,7 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
             entity = await client.get_entity(part)
             chat_ids.append(entity.id)
         except Exception:
-            if part.isdigit():
+            if part.lstrip("-").isdigit():
                 chat_ids.append(int(part))
             else:
                 await message.answer("⚠️ Чат не найден. Проверьте доступность и корректность ссылки.")
