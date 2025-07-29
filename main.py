@@ -86,6 +86,8 @@ def load_user_data():
                 u.setdefault('inactive_notified', False)
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
+                    p.setdefault('name', 'Без названия')
+                    p.setdefault('account', '')
             return data
         except Exception:
             logging.exception("Failed to load user data")
@@ -266,8 +268,10 @@ class PromoStates(StatesGroup):
 
 
 class ParserStates(StatesGroup):
+    waiting_name = State()
     waiting_chats = State()
     waiting_keywords = State()
+    waiting_account = State()
 
 
 class EditParserStates(StatesGroup):
@@ -314,9 +318,13 @@ async def cmd_info(message: types.Message):
         return
     lines = []
     for idx, p in enumerate(parsers, 1):
+        name = p.get('name', f'Парсер {idx}')
         chats = p.get('chats') or []
         kws = p.get('keywords') or []
-        lines.append(f"#{idx} Чаты: {chats}\nКлючевые слова: {', '.join(kws)}")
+        account = p.get('account', '')
+        lines.append(
+            f"#{idx} {name}\nАккаунт: {account}\nЧаты: {chats}\nКлючевые слова: {', '.join(kws)}"
+        )
     await message.answer("\n\n".join(lines))
 
 
@@ -401,8 +409,9 @@ async def cb_result(call: types.CallbackQuery):
         await call.answer()
         return
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for idx, _ in enumerate(data.get('parsers'), 1):
-        kb.add(types.InlineKeyboardButton(f"Парсер #{idx}", callback_data=f"csv_{idx}"))
+    for idx, p in enumerate(data.get('parsers'), 1):
+        name = p.get('name', f'Парсер {idx}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f"csv_{idx}"))
     await call.message.answer("Выберите парсер для получения CSV:", reply_markup=kb)
     await call.answer()
 
@@ -427,8 +436,9 @@ async def cb_active_parsers(call: types.CallbackQuery):
         await call.answer()
         return
     kb = types.InlineKeyboardMarkup(row_width=1)
-    for idx, _ in enumerate(data.get('parsers'), 1):
-        kb.add(types.InlineKeyboardButton(f"Парсер #{idx}", callback_data=f"edit_{idx}"))
+    for idx, p in enumerate(data.get('parsers'), 1):
+        name = p.get('name', f'Парсер {idx}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f"edit_{idx}"))
     await call.message.answer("Активные парсеры:", reply_markup=kb)
     await call.answer()
 
@@ -530,6 +540,7 @@ async def send_all_results(user_id: int):
 @dp.callback_query_handler(lambda c: c.data.startswith('edit_') and c.data.count('_') == 1)
 async def cb_edit_parser(call: types.CallbackQuery):
     idx = int(call.data.split('_')[1]) - 1
+    parser = user_data.get(str(call.from_user.id), {}).get('parsers', [])[idx]
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton(
@@ -539,7 +550,8 @@ async def cb_edit_parser(call: types.CallbackQuery):
             "Изменить ключевые слова", callback_data=f"edit_keywords_{idx+1}"
         ),
     )
-    await call.message.answer(f"Парсер #{idx+1}. Что изменить?", reply_markup=kb)
+    name = parser.get('name', f'Парсер {idx+1}') if parser else f'Парсер {idx+1}'
+    await call.message.answer(f"{name}. Что изменить?", reply_markup=kb)
     await call.answer()
 
 
@@ -564,6 +576,18 @@ async def cb_edit_keywords(call: types.CallbackQuery, state: FSMContext):
     await EditParserStates.waiting_keywords.set()
     await call.answer()
 
+
+@dp.message_handler(state=ParserStates.waiting_name)
+async def get_parser_name(message: types.Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("Название не может быть пустым. Попробуйте ещё раз:")
+        return
+    await state.update_data(parser_name=name)
+    await message.answer(
+        "Укажите ссылки на чаты или каналы (через пробел или запятую):"
+    )
+    await ParserStates.waiting_chats.set()
 
 @dp.message_handler(commands=['addparser'], state='*')
 async def cmd_add_parser(message: types.Message, state: FSMContext):
@@ -590,8 +614,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         for p in user_clients[user_id]['parsers']:
             await start_monitor(user_id, p)
 
-    await message.answer("Укажите ссылки на чаты или каналы (через пробел или запятую):")
-    await ParserStates.waiting_chats.set()
+    await message.answer("Введите название парсера:")
+    await ParserStates.waiting_name.set()
 
 @dp.message_handler(commands=['login'], state="*")
 async def start_login(message: types.Message, state: FSMContext):
@@ -834,17 +858,9 @@ async def _process_keywords(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Сначала укажите чаты.")
         return
 
-    parser = {'chats': chat_ids, 'keywords': keywords, 'results': []}
-    info = user_clients.setdefault(user_id, {})
-    info.setdefault('parsers', []).append(parser)
-    if str(user_id) in user_data:
-        user_data[str(user_id)].setdefault('parsers', []).append(parser)
-        save_user_data(user_data)
-
-    await start_monitor(user_id, parser)
-
-    await message.answer("✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
-    await state.finish()
+    await state.update_data(keywords=keywords)
+    await message.answer("Укажите аккаунт для привязки парсера (например, @username):")
+    await ParserStates.waiting_account.set()
 
 
 @dp.message_handler(state=AuthStates.waiting_keywords)
@@ -855,6 +871,36 @@ async def get_keywords_auth(message: types.Message, state: FSMContext):
 @dp.message_handler(state=ParserStates.waiting_keywords)
 async def get_keywords_parser(message: types.Message, state: FSMContext):
     await _process_keywords(message, state)
+
+
+@dp.message_handler(state=ParserStates.waiting_account)
+async def get_parser_account(message: types.Message, state: FSMContext):
+    account = message.text.strip()
+    user_id = message.from_user.id
+    data = await state.get_data()
+    chat_ids = data.get('chat_ids')
+    keywords = data.get('keywords')
+    name = data.get(
+        'parser_name',
+        f"Парсер {len(user_data.get(str(user_id), {}).get('parsers', [])) + 1}"
+    )
+    parser = {
+        'name': name,
+        'chats': chat_ids,
+        'keywords': keywords,
+        'account': account,
+        'results': [],
+    }
+    info = user_clients.setdefault(user_id, {})
+    info.setdefault('parsers', []).append(parser)
+    if str(user_id) in user_data:
+        user_data[str(user_id)].setdefault('parsers', []).append(parser)
+        save_user_data(user_data)
+
+    await start_monitor(user_id, parser)
+
+    await message.answer("✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
+    await state.finish()
 
 
 @dp.message_handler(state=EditParserStates.waiting_chats)
