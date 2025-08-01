@@ -85,6 +85,7 @@ def load_user_data():
                 u.setdefault('reminder3_sent', False)
                 u.setdefault('reminder1_sent', False)
                 u.setdefault('inactive_notified', False)
+                u.setdefault('used_promos', [])
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
@@ -440,9 +441,15 @@ async def cb_delp_confirm(call: types.CallbackQuery):
     await send_parser_results(user_id, idx)
     data = user_data.get(str(user_id))
     if data and 0 <= idx < len(data.get('parsers', [])):
+        parser = data['parsers'][idx]
+        if parser.get('paid'):
+            await call.message.answer("Оплаченный парсер нельзя удалить.")
+            await call.answer()
+            return
+        stop_monitor(user_id, parser)
         data['parsers'].pop(idx)
         save_user_data(user_data)
-    await call.message.answer("Парсер удалён.")
+        await call.message.answer("Парсер удалён.")
     await call.answer()
 
 
@@ -635,12 +642,21 @@ async def cmd_tariff_pro(message: types.Message, state: FSMContext):
 
 @dp.message_handler(state=PromoStates.waiting_promo)
 async def promo_entered(message: types.Message, state: FSMContext):
-    code = message.text.strip()
+    code = message.text.strip().upper()
     user_id = message.from_user.id
-    if code.upper() == 'DEMO':
+    data = user_data.setdefault(str(user_id), {})
+    used_promos = data.setdefault('used_promos', [])
+    if code in used_promos:
+        await message.answer(
+            t('promo_already_used'),
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+        await state.finish()
+        return
+    if code == 'DEMO':
         expiry = int((datetime.utcnow() + timedelta(days=7)).timestamp())
-        data = user_data.setdefault(str(user_id), {})
         data['subscription_expiry'] = expiry
+        used_promos.append(code)
         save_user_data(user_data)
         await message.answer(
             "Промокод принят! Вам предоставлено 7 дней бесплатного тарифа PRO.",
