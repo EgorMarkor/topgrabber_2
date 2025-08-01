@@ -328,22 +328,196 @@ async def cmd_info(message: types.Message):
     await message.answer("\n\n".join(lines))
 
 
+def main_menu_keyboard() -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🛠 Настройка и оплата парсеров", callback_data="menu_setup"
+        ),
+        types.InlineKeyboardButton(
+            "📤 Экспорт результатов в таблицу", callback_data="menu_export"
+        ),
+        types.InlineKeyboardButton(
+            "📚 Помощь и документация", callback_data="menu_help"
+        ),
+        types.InlineKeyboardButton(
+            "🤝 Профиль и Партнёрская программа", callback_data="menu_profile"
+        ),
+    )
+    return kb
+
+
 @dp.message_handler(commands=['start'], state="*")
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
     check_subscription(message.from_user.id)
-    text = t('welcome')
+    await message.answer(t('welcome'))
+    await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+
+
+@dp.message_handler(commands=['menu'], state="*")
+async def cmd_menu(message: types.Message):
+    await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+
+
+@dp.callback_query_handler(lambda c: c.data == 'back_main')
+async def cb_back_main(call: types.CallbackQuery):
+    await call.message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'menu_setup')
+async def cb_menu_setup(call: types.CallbackQuery):
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
-        types.InlineKeyboardButton("Тариф PRO", callback_data="tariff_pro"),
-        types.InlineKeyboardButton("Результат", callback_data="result"),
-        types.InlineKeyboardButton("Помощь", callback_data="help_info"),
-        types.InlineKeyboardButton("Информация", callback_data="info"),
-        types.InlineKeyboardButton(
-            "Просмотр активных парсеров", callback_data="active_parsers"
-        ),
+        types.InlineKeyboardButton("🚀 Новый парсер", callback_data="setup_new"),
+        types.InlineKeyboardButton("✏️ Мои парсеры", callback_data="setup_list"),
+        types.InlineKeyboardButton("💳 Оплата", callback_data="setup_pay"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"),
     )
-    await message.answer(text, reply_markup=kb)
+    await call.message.answer(t('menu_setup'), reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'setup_new')
+async def cb_setup_new(call: types.CallbackQuery, state: FSMContext):
+    await call.answer()
+    await cmd_add_parser(call.message, state)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'setup_list')
+async def cb_setup_list(call: types.CallbackQuery):
+    await cb_active_parsers(call)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'setup_pay')
+async def cb_setup_pay(call: types.CallbackQuery, state: FSMContext):
+    await cb_tariff_pro(call, state)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'menu_export')
+async def cb_menu_export(call: types.CallbackQuery):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📤 Общий результат", callback_data="export_all"),
+        types.InlineKeyboardButton("📂 Выбрать парсер", callback_data="export_choose"),
+        types.InlineKeyboardButton("🔔 Моментальные уведомления", callback_data="export_alert"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"),
+    )
+    await call.message.answer(t('menu_export'), reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'export_all')
+async def cb_export_all(call: types.CallbackQuery):
+    await send_all_results(call.from_user.id)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'export_choose')
+async def cb_export_choose(call: types.CallbackQuery):
+    await cb_result(call)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'export_alert')
+async def cb_export_alert(call: types.CallbackQuery):
+    link = f"https://t.me/TopGrabberAlertBot?start={call.from_user.id}"
+    await call.message.answer(
+        "Подключите алерт-бот — и новые лиды будут прилетать прямо в Telegram с текстом запроса, ссылкой на сообщение и автором.\n"
+        f"{link}"
+    )
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'menu_help')
+async def cb_menu_help(call: types.CallbackQuery):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("❓ Как начать", callback_data="help_start"),
+        types.InlineKeyboardButton("🧑‍💻 Поддержка", callback_data="help_support"),
+        types.InlineKeyboardButton("📄 О нас", callback_data="help_about"),
+        types.InlineKeyboardButton("🚀 Новый парсер", callback_data="setup_new"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"),
+    )
+    await call.message.answer(t('menu_help'), reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'help_start')
+async def cb_help_start(call: types.CallbackQuery):
+    await cmd_help(call.message)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'help_support')
+async def cb_help_support(call: types.CallbackQuery):
+    await call.message.answer("Свяжитесь с поддержкой: https://t.me/TopGrabberSupport")
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'help_about')
+async def cb_help_about(call: types.CallbackQuery):
+    await cb_info(call)
+
+
+@dp.callback_query_handler(lambda c: c.data == 'menu_profile')
+async def cb_menu_profile(call: types.CallbackQuery):
+    data = user_data.get(str(call.from_user.id), {})
+    now = int(datetime.utcnow().timestamp())
+    if data.get('subscription_expiry', 0) > now:
+        plan_name = 'PRO'
+        paid_to = datetime.utcfromtimestamp(data['subscription_expiry']).strftime('%Y-%m-%d')
+    else:
+        plan_name = 'Нет активной подписки'
+        paid_to = '—'
+    rec_status = '🔁' if data.get('recurring') else ''
+    text = t(
+        'menu_profile',
+        user_id=call.from_user.id,
+        username=call.from_user.username or '',
+        plan_name=plan_name,
+        paid_to=paid_to,
+        rec_status=rec_status,
+        promo_code=data.get('promo_code', 'N/A'),
+        ref_count=data.get('ref_count', 0),
+        ref_active_users=data.get('ref_active_users', 0),
+        ref_month_income=data.get('ref_month_income', 0),
+        ref_total=data.get('ref_total', 0),
+        ref_balance=data.get('ref_balance', 0),
+    )
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "💳 Оплата с партнерского баланса", callback_data="profile_paybalance"
+        ),
+        types.InlineKeyboardButton(
+            "💸 Вывести средства", callback_data="profile_withdraw"
+        ),
+        types.InlineKeyboardButton(
+            "⛔️ Удалить карту", callback_data="profile_delete_card"
+        ),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"),
+    )
+    await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'profile_paybalance')
+async def cb_profile_paybalance(call: types.CallbackQuery):
+    await call.message.answer("Функция оплаты с партнёрского баланса пока недоступна.")
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'profile_withdraw')
+async def cb_profile_withdraw(call: types.CallbackQuery):
+    await call.message.answer("Функция вывода средств пока недоступна.")
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'profile_delete_card')
+async def cb_profile_delete_card(call: types.CallbackQuery):
+    await call.message.answer("Данные карты удалены.")
+    await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
