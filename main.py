@@ -194,6 +194,7 @@ async def start_monitor(user_id: int, parser: dict):
     client = info['client']
     chat_ids = parser.get('chats')
     keywords = parser.get('keywords')
+    exclude = [normalize_word(w) for w in parser.get('exclude_keywords', [])]
     if not chat_ids or not keywords:
         return
 
@@ -206,7 +207,7 @@ async def start_monitor(user_id: int, parser: dict):
         text = event.raw_text or ''
         words = [normalize_word(w) for w in re.findall(r'\w+', text.lower())]
         for kw in keywords:
-            if normalize_word(kw) in words:
+            if normalize_word(kw) in words and not any(e in words for e in exclude):
                 chat = await event.get_chat()
                 title = getattr(chat, 'title', str(event.chat_id))
                 username = getattr(sender, 'username', None)
@@ -284,6 +285,9 @@ class ParserStates(StatesGroup):
 class EditParserStates(StatesGroup):
     waiting_chats = State()
     waiting_keywords = State()
+    waiting_exclude = State()
+    waiting_name = State()
+    waiting_account = State()
 
 
 @dp.message_handler(commands=["help"])
@@ -347,6 +351,65 @@ def main_menu_keyboard() -> types.InlineKeyboardMarkup:
         ),
     )
     return kb
+
+
+def parser_settings_keyboard(idx: int) -> types.InlineKeyboardMarkup:
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🛠 Изменить название", callback_data=f"edit_name_{idx}"
+        ),
+        types.InlineKeyboardButton(
+            "📂 Изменить чаты", callback_data=f"edit_chats_{idx}"
+        ),
+        types.InlineKeyboardButton(
+            "📂 Изменить слова", callback_data=f"edit_keywords_{idx}"
+        ),
+        types.InlineKeyboardButton(
+            "📂 Изменить искл-слова", callback_data=f"edit_exclude_{idx}"
+        ),
+        types.InlineKeyboardButton(
+            "🛠 Изменить аккаунт-парсер", callback_data=f"edit_account_{idx}"
+        ),
+        types.InlineKeyboardButton(
+            "💳 Тариф и оплата", callback_data=f"edit_tariff_{idx}"
+        ),
+    )
+    return kb
+
+
+def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
+    idx = parser.get('id') or 1
+    name = parser.get('name', f'Парсер_{idx}')
+    chat_count = len(parser.get('chats', []))
+    include_count = len(parser.get('keywords', []))
+    exclude_count = len(parser.get('exclude_keywords', []))
+    account_label = parser.get('account') or 'не привязан'
+    data = user_data.get(str(user_id), {})
+    plan_name = 'PRO'
+    if data.get('subscription_expiry'):
+        paid_to = datetime.utcfromtimestamp(data['subscription_expiry']).strftime('%Y-%m-%d')
+    else:
+        paid_to = '—'
+    chat_limit = '/5' if plan_name == 'PRO' else ''
+    status_emoji = '🟢' if parser.get('handler') else '⏸'
+    status_text = 'Активен' if parser.get('handler') else 'Остановлен'
+    if created:
+        return t('parser_created', id=idx)
+    return t(
+        'parser_info',
+        name=name,
+        id=idx,
+        chat_count=chat_count,
+        chat_limit=chat_limit,
+        include_count=include_count,
+        exclude_count=exclude_count,
+        account_label=account_label,
+        plan_name=plan_name,
+        paid_to=paid_to,
+        status_emoji=status_emoji,
+        status_text=status_text,
+    )
 
 
 @dp.message_handler(commands=['start'], state="*")
@@ -855,17 +918,10 @@ async def send_parser_results(user_id: int, idx: int):
 async def cb_edit_parser(call: types.CallbackQuery):
     idx = int(call.data.split('_')[1]) - 1
     parser = user_data.get(str(call.from_user.id), {}).get('parsers', [])[idx]
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton(
-            "Изменить чаты", callback_data=f"edit_chats_{idx+1}"
-        ),
-        types.InlineKeyboardButton(
-            "Изменить ключевые слова", callback_data=f"edit_keywords_{idx+1}"
-        ),
+    text = parser_info_text(call.from_user.id, parser)
+    await call.message.answer(
+        text, reply_markup=parser_settings_keyboard(idx + 1)
     )
-    name = parser.get('name', f'Парсер {idx+1}') if parser else f'Парсер {idx+1}'
-    await call.message.answer(f"{name}. Что изменить?", reply_markup=kb)
     await call.answer()
 
 
@@ -889,6 +945,42 @@ async def cb_edit_keywords(call: types.CallbackQuery, state: FSMContext):
     )
     await EditParserStates.waiting_keywords.set()
     await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('edit_exclude_'), state='*')
+async def cb_edit_exclude(call: types.CallbackQuery, state: FSMContext):
+    idx = int(call.data.split('_')[2]) - 1
+    await state.update_data(edit_idx=idx)
+    await call.message.answer(
+        "Введите новые исключающие слова (через запятую):"
+    )
+    await EditParserStates.waiting_exclude.set()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('edit_name_'), state='*')
+async def cb_edit_name(call: types.CallbackQuery, state: FSMContext):
+    idx = int(call.data.split('_')[2]) - 1
+    await state.update_data(edit_idx=idx)
+    await call.message.answer("Введите новое название парсера:")
+    await EditParserStates.waiting_name.set()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('edit_account_'), state='*')
+async def cb_edit_account(call: types.CallbackQuery, state: FSMContext):
+    idx = int(call.data.split('_')[2]) - 1
+    await state.update_data(edit_idx=idx)
+    await call.message.answer(
+        "Введите аккаунт для привязки (например, @username):"
+    )
+    await EditParserStates.waiting_account.set()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('edit_tariff_'))
+async def cb_edit_tariff(call: types.CallbackQuery, state: FSMContext):
+    await cb_tariff_pro(call, state)
 
 
 @dp.message_handler(state=ParserStates.waiting_name)
@@ -933,8 +1025,25 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         for p in user_clients[user_id]['parsers']:
             await start_monitor(user_id, p)
 
-    await message.answer("Введите название парсера:")
-    await ParserStates.waiting_name.set()
+    parsers = user_data.setdefault(str(user_id), {}).setdefault('parsers', [])
+    parser_id = len(parsers) + 1
+    parser = {
+        'id': parser_id,
+        'name': f'Парсер_{parser_id}',
+        'chats': [],
+        'keywords': [],
+        'exclude_keywords': [],
+        'account': '',
+        'results': [],
+    }
+    parsers.append(parser)
+    info = user_clients.setdefault(user_id, info or {})
+    info.setdefault('parsers', []).append(parser)
+    save_user_data(user_data)
+    await message.answer(
+        parser_info_text(user_id, parser, created=True),
+        reply_markup=parser_settings_keyboard(parser_id),
+    )
 
 @dp.message_handler(commands=['login'], state="*")
 async def start_login(message: types.Message, state: FSMContext):
@@ -1272,6 +1381,50 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
     await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Ключевые слова обновлены.")
+
+
+@dp.message_handler(state=EditParserStates.waiting_exclude)
+async def edit_exclude_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get('edit_idx')
+    words = [w.strip().lower() for w in message.text.split(',') if w.strip()]
+    user_id = message.from_user.id
+    parser = user_data[str(user_id)]['parsers'][idx]
+    stop_monitor(user_id, parser)
+    parser['exclude_keywords'] = words
+    save_user_data(user_data)
+    await start_monitor(user_id, parser)
+    await state.finish()
+    await message.answer("✅ Исключающие слова обновлены.")
+
+
+@dp.message_handler(state=EditParserStates.waiting_name)
+async def edit_name_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get('edit_idx')
+    new_name = message.text.strip()
+    user_id = message.from_user.id
+    parser = user_data[str(user_id)]['parsers'][idx]
+    parser_id = parser.get('id', idx + 1)
+    parser['name'] = f"{new_name}_{parser_id}"
+    save_user_data(user_data)
+    await state.finish()
+    await message.answer("✅ Название обновлено.")
+
+
+@dp.message_handler(state=EditParserStates.waiting_account)
+async def edit_account_handler(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    idx = data.get('edit_idx')
+    account = message.text.strip()
+    user_id = message.from_user.id
+    parser = user_data[str(user_id)]['parsers'][idx]
+    stop_monitor(user_id, parser)
+    parser['account'] = account
+    save_user_data(user_data)
+    await start_monitor(user_id, parser)
+    await state.finish()
+    await message.answer("✅ Аккаунт обновлён.")
 
 if __name__ == '__main__':
     print("Bot is starting...")
