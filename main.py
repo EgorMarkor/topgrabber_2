@@ -279,15 +279,10 @@ class EditParserStates(StatesGroup):
     waiting_keywords = State()
 
 
-@dp.message_handler(commands=['help'])
+@dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
-    await message.answer(
-        "Данный бот отслеживает ключевые слова в указанных чатах.\n"
-        "/start - начать или восстановить работу\n"
-        "/login - принудительно начать авторизацию заново\n"
-        "/info - показать текущие сохранённые настройки\n"
-        "/addparser - добавить ещё один парсер"
-    )
+    """Отправить справочную информацию."""
+    await message.answer("[[Как начать]]\n[[FAQ]]\nhttps://t.me/+PqfIWqHquts4YjQy")
 
 
 @dp.message_handler(commands=['enable_recurring'])
@@ -351,13 +346,98 @@ def main_menu_keyboard() -> types.InlineKeyboardMarkup:
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
     check_subscription(message.from_user.id)
-    await message.answer(t('welcome'))
-    await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+    data = user_data.setdefault(str(message.from_user.id), {})
+    if not data.get('started'):
+        data['started'] = True
+        save_user_data(user_data)
+        await message.answer(t('welcome'), reply_markup=main_menu_keyboard())
+    else:
+        await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
 
 
 @dp.message_handler(commands=['menu'], state="*")
 async def cmd_menu(message: types.Message):
     await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+
+
+@dp.message_handler(commands=['result'])
+async def cmd_result(message: types.Message):
+    """Отправить последнюю таблицу результатов."""
+    await send_all_results(message.from_user.id)
+
+
+@dp.message_handler(commands=['clear_result'])
+async def cmd_clear_result(message: types.Message):
+    """Отправить последнюю таблицу и очистить её."""
+    await send_all_results(message.from_user.id)
+    data = user_data.get(str(message.from_user.id))
+    if data:
+        for parser in data.get('parsers', []):
+            parser['results'] = []
+        save_user_data(user_data)
+
+
+@dp.message_handler(commands=['delete_card'])
+async def cmd_delete_card(message: types.Message):
+    """Удалить сохранённые данные карты пользователя."""
+    data = user_data.get(str(message.from_user.id))
+    if data:
+        data.pop('card', None)
+        save_user_data(user_data)
+    await message.answer("Данные карты удалены.")
+
+
+@dp.message_handler(commands=['delete_parser'])
+async def cmd_delete_parser(message: types.Message):
+    """Начать процесс удаления парсера."""
+    data = user_data.get(str(message.from_user.id))
+    if not data:
+        await message.answer("Данные не найдены.")
+        return
+    parsers = [
+        (idx, p)
+        for idx, p in enumerate(data.get('parsers', []))
+        if not p.get('paid')
+    ]
+    if not parsers:
+        await message.answer("Нет доступных парсеров для удаления.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for idx, p in parsers:
+        name = p.get('name', f'Парсер {idx+1}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'delp_select_{idx}'))
+    await message.answer("Выберите парсер для удаления:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delp_select_'))
+async def cb_delp_select(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[2])
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("Нет", callback_data='delp_cancel'),
+        types.InlineKeyboardButton("Да", callback_data=f'delp_confirm_{idx}')
+    )
+    await call.message.answer("Удалить парсер?", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'delp_cancel')
+async def cb_delp_cancel(call: types.CallbackQuery):
+    await call.message.answer("Удаление отменено.")
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('delp_confirm_'))
+async def cb_delp_confirm(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[2])
+    user_id = call.from_user.id
+    await send_parser_results(user_id, idx)
+    data = user_data.get(str(user_id))
+    if data and 0 <= idx < len(data.get('parsers', [])):
+        data['parsers'].pop(idx)
+        save_user_data(user_data)
+    await call.message.answer("Парсер удалён.")
+    await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == 'back_main')
@@ -704,6 +784,36 @@ async def send_all_results(user_id: int):
         writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
         writer.writerows(rows)
     await bot.send_document(user_id, types.InputFile(path), caption=t('csv_export_ready'))
+    os.remove(path)
+
+
+async def send_parser_results(user_id: int, idx: int):
+    """Отправить CSV с результатами выбранного парсера."""
+    data = user_data.get(str(user_id))
+    if not data:
+        return
+    parsers = data.get('parsers', [])
+    if idx < 0 or idx >= len(parsers):
+        return
+    parser = parsers[idx]
+    results = parser.get('results', [])
+    if not results:
+        await bot.send_message(user_id, t('no_results'))
+        return
+    path = f"results_{user_id}_{idx+1}.csv"
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
+        for r in results:
+            writer.writerow([
+                r.get('keyword', ''),
+                r.get('chat', ''),
+                r.get('sender', ''),
+                r.get('datetime', ''),
+                r.get('link', ''),
+                r.get('text', '').replace('\n', ' '),
+            ])
+    await bot.send_document(user_id, types.InputFile(path))
     os.remove(path)
 
 
