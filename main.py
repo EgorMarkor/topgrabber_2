@@ -5,6 +5,7 @@ import json
 import os
 import html
 import csv
+import copy
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
@@ -96,8 +97,13 @@ def load_user_data():
 
 def save_user_data(data):
     try:
+        data_copy = copy.deepcopy(data)
+        for u in data_copy.values():
+            for p in u.get('parsers', []):
+                p.pop('handler', None)
+                p.pop('event', None)
         with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump(data_copy, f, ensure_ascii=False, indent=2)
     except Exception:
         logging.exception("Failed to save user data")
 
@@ -600,23 +606,31 @@ async def cb_profile_delete_card(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
-async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
-    user_id = call.from_user.id
+async def _process_tariff_pro(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
     data = user_data.get(str(user_id))
     if data and data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
-        await call.answer()
-        await cmd_add_parser(call.message, state)
+        await cmd_add_parser(message, state)
         return
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("Пропустить")
-    await call.message.answer(
+    await message.answer(
         "Введите промокод или нажмите 'Пропустить'.",
         reply_markup=markup,
     )
     await PromoStates.waiting_promo.set()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
+async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
+    await _process_tariff_pro(call.message, state)
     await call.answer()
+
+
+@dp.message_handler(commands=['tariff_pro'])
+async def cmd_tariff_pro(message: types.Message, state: FSMContext):
+    await _process_tariff_pro(message, state)
 
 
 @dp.message_handler(state=PromoStates.waiting_promo)
