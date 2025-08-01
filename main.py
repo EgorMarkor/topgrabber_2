@@ -897,8 +897,13 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         if not saved:
             await message.answer("Сначала авторизуйтесь командой /login")
             return
+        api_id = saved.get('api_id')
+        api_hash = saved.get('api_hash')
+        if not api_id or not api_hash:
+            await message.answer("Сначала авторизуйтесь командой /login")
+            return
         session_name = f"session_{user_id}"
-        client = TelegramClient(session_name, saved['api_id'], saved['api_hash'])
+        client = TelegramClient(session_name, api_id, api_hash)
         await client.connect()
         if not await client.is_user_authorized():
             await message.answer("Сессия найдена, но требует входа. Используйте /login")
@@ -935,21 +940,24 @@ async def start_login(message: types.Message, state: FSMContext):
             logging.exception("Failed to disconnect previous session")
     saved = user_data.get(str(user_id))
     if saved:
-        session_name = f"session_{user_id}"
-        client = TelegramClient(session_name, saved['api_id'], saved['api_hash'])
-        await client.connect()
-        if await client.is_user_authorized():
-            user_clients[user_id] = {
-                'client': client,
-                'phone': saved.get('phone'),
-                'phone_hash': '',
-                'parsers': saved.get('parsers', [])
-            }
-            for p in user_clients[user_id]['parsers']:
-                await start_monitor(user_id, p)
-            if user_clients[user_id]['parsers']:
-                await message.answer("✅ Найдены сохранённые парсеры. Мониторинг запущен.")
-                return
+        api_id = saved.get('api_id')
+        api_hash = saved.get('api_hash')
+        if api_id and api_hash:
+            session_name = f"session_{user_id}"
+            client = TelegramClient(session_name, api_id, api_hash)
+            await client.connect()
+            if await client.is_user_authorized():
+                user_clients[user_id] = {
+                    'client': client,
+                    'phone': saved.get('phone'),
+                    'phone_hash': '',
+                    'parsers': saved.get('parsers', [])
+                }
+                for p in user_clients[user_id]['parsers']:
+                    await start_monitor(user_id, p)
+                if user_clients[user_id]['parsers']:
+                    await message.answer("✅ Найдены сохранённые парсеры. Мониторинг запущен.")
+                    return
         await message.answer("👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:", parse_mode="Markdown")
     else:
         await message.answer(
