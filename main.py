@@ -1038,7 +1038,9 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     }
     parsers.append(parser)
     info = user_clients.setdefault(user_id, info or {})
-    info.setdefault('parsers', []).append(parser)
+    # Avoid duplicating the parser in runtime storage; ensure both
+    # user_clients and persistent user_data reference the same list.
+    info['parsers'] = parsers
     save_user_data(user_data)
     await message.answer(
         parser_info_text(user_id, parser, created=True),
