@@ -375,6 +375,9 @@ def parser_settings_keyboard(idx: int) -> types.InlineKeyboardMarkup:
             "💳 Тариф и оплата", callback_data=f"edit_tariff_{idx}"
         ),
     )
+    kb.add(
+        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main")
+    )
     return kb
 
 
@@ -476,6 +479,7 @@ async def cmd_delete_parser(message: types.Message):
     for idx, p in parsers:
         name = p.get('name', f'Парсер {idx+1}')
         kb.add(types.InlineKeyboardButton(name, callback_data=f'delp_select_{idx}'))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
     await message.answer("Выберите парсер для удаления:", reply_markup=kb)
 
 
@@ -494,6 +498,7 @@ async def cb_delp_select(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == 'delp_cancel')
 async def cb_delp_cancel(call: types.CallbackQuery):
     await call.message.answer("Удаление отменено.")
+    await call.message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
     await call.answer()
 
 
@@ -513,6 +518,7 @@ async def cb_delp_confirm(call: types.CallbackQuery):
         data['parsers'].pop(idx)
         save_user_data(user_data)
         await call.message.answer("Парсер удалён.")
+    await call.message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
     await call.answer()
 
 
@@ -567,6 +573,7 @@ async def cb_menu_export(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == 'export_all')
 async def cb_export_all(call: types.CallbackQuery):
     await send_all_results(call.from_user.id)
+    await call.message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
     await call.answer()
 
 
@@ -759,6 +766,7 @@ async def cb_result(call: types.CallbackQuery):
     for idx, p in enumerate(data.get('parsers'), 1):
         name = p.get('name', f'Парсер {idx}')
         kb.add(types.InlineKeyboardButton(name, callback_data=f"csv_{idx}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
     await call.message.answer("Выберите парсер для получения CSV:", reply_markup=kb)
     await call.answer()
 
@@ -786,6 +794,7 @@ async def cb_active_parsers(call: types.CallbackQuery):
     for idx, p in enumerate(data.get('parsers'), 1):
         name = p.get('name', f'Парсер {idx}')
         kb.add(types.InlineKeyboardButton(name, callback_data=f"edit_{idx}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
     await call.message.answer("Активные парсеры:", reply_markup=kb)
     await call.answer()
 
@@ -826,6 +835,7 @@ async def cb_send_csv(call: types.CallbackQuery):
             ])
     await bot.send_document(user_id, types.InputFile(path))
     os.remove(path)
+    await call.message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
     await call.answer()
 
 
