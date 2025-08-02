@@ -54,6 +54,9 @@ TEXT_FILE = "texts.json"
 with open(TEXT_FILE, "r", encoding="utf-8") as f:
     TEXTS = json.load(f)
 
+# Maximum number of chats allowed for PRO plan
+CHAT_LIMIT = 5
+
 # Morphological analysis utilities
 morph = MorphAnalyzer()
 stemmer_en = snowballstemmer.stemmer("english")
@@ -397,7 +400,7 @@ def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
         paid_to = datetime.utcfromtimestamp(data['subscription_expiry']).strftime('%Y-%m-%d')
     else:
         paid_to = '—'
-    chat_limit = '/5' if plan_name == 'PRO' else ''
+    chat_limit = f'/{CHAT_LIMIT}' if plan_name == 'PRO' else ''
     status_emoji = '🟢' if parser.get('handler') else '⏸'
     status_text = 'Активен' if parser.get('handler') else 'Остановлен'
     if created:
@@ -1370,6 +1373,10 @@ async def _process_chats(message: types.Message, state: FSMContext, next_state):
         await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
         return None
 
+    if len(chat_ids) > CHAT_LIMIT:
+        await message.answer(f"⚠️ Можно указать не более {CHAT_LIMIT} чатов.")
+        return None
+
     await state.update_data(chat_ids=chat_ids)
     await message.answer("Отлично! Теперь введите ключевые слова для мониторинга (через запятую):")
     await next_state.set()
@@ -1464,6 +1471,10 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
                 return
     if not chat_ids:
         await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
+        return
+
+    if len(chat_ids) > CHAT_LIMIT:
+        await message.answer(f"⚠️ Можно указать не более {CHAT_LIMIT} чатов.")
         return
     parser = user_data[str(user_id)]['parsers'][idx]
     stop_monitor(user_id, parser)
