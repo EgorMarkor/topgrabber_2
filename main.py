@@ -426,7 +426,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
 
 @dp.message_handler(commands=['menu'], state="*")
-async def cmd_menu(message: types.Message):
+async def cmd_menu(message: types.Message, state: FSMContext):
+    await state.finish()
     await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
 
 
