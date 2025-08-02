@@ -420,9 +420,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if not data.get('started'):
         data['started'] = True
         save_user_data(user_data)
-        await message.answer(t('welcome'), reply_markup=main_menu_keyboard())
-    else:
-        await message.answer(t('menu_main'), reply_markup=main_menu_keyboard())
+    await message.answer(t('welcome'), reply_markup=main_menu_keyboard())
 
 
 @dp.message_handler(commands=['menu'], state="*")
