@@ -36,7 +36,8 @@ dp = Dispatcher(bot, storage=storage)
 # ЮKassa configuration
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
-PRO_PRICE = "1990.00"
+PRO_PRICE = "1490.00"
+PRO_DAILY_COST = 49.67
 RETURN_URL = "https://t.me/TOPGrabber_bot"
 if YOOKASSA_SHOP_ID and YOOKASSA_TOKEN:
     Configuration.account_id = YOOKASSA_SHOP_ID
@@ -86,10 +87,13 @@ def load_user_data():
                 u.setdefault('reminder1_sent', False)
                 u.setdefault('inactive_notified', False)
                 u.setdefault('used_promos', [])
+                u.setdefault('balance', 0)
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
                     p.setdefault('account', '')
+                    p.setdefault('paused', False)
+                    p.setdefault('daily_cost', PRO_DAILY_COST)
             return data
         except Exception:
             logging.exception("Failed to load user data")
@@ -171,7 +175,7 @@ INFO_TEXT = (
     "Инструкция к боту (https://dzen.ru/a/ZuHH1h_M5kqcam1A)\n"
     "Бот для получения сообщений (https://t.me/TOPGrabber_bot)\n\n"
     "Минимальное количество чатов - 5шт\n"
-    "Цена:\n1 990₽/ 30 дней\n"
+    "Цена:\n1 490₽/ 30 дней\n"
     "Купить 1 дополнительный чат:\n490₽/ 30 дней\n\n"
     "Copyright © 2024 TOPGrabberbot — AI-Парсер сообщений | "
     "ИП Антуфьев Б.В. (https://telegra.ph/Rekvizity-08-20-2) "
@@ -457,6 +461,78 @@ async def cmd_delete_card(message: types.Message):
     await message.answer("Данные карты удалены.")
 
 
+@dp.message_handler(commands=['pause_parser'])
+async def cmd_pause_parser(message: types.Message):
+    """Поставить парсер на паузу."""
+    data = user_data.get(str(message.from_user.id))
+    if not data:
+        await message.answer("Данные не найдены.")
+        return
+    parsers = [
+        (idx, p)
+        for idx, p in enumerate(data.get('parsers', []))
+        if not p.get('paused')
+    ]
+    if not parsers:
+        await message.answer("Нет активных парсеров.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for idx, p in parsers:
+        name = p.get('name', f'Парсер {idx+1}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'pause_{idx}'))
+    await message.answer("Выберите парсер для паузы:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pause_'))
+async def cb_pause_parser(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[1])
+    user_id = call.from_user.id
+    data = user_data.get(str(user_id))
+    if data and 0 <= idx < len(data.get('parsers', [])):
+        parser = data['parsers'][idx]
+        stop_monitor(user_id, parser)
+        parser['paused'] = True
+        save_user_data(user_data)
+        await call.message.answer("Парсер поставлен на паузу.")
+    await call.answer()
+
+
+@dp.message_handler(commands=['resume_parser'])
+async def cmd_resume_parser(message: types.Message):
+    """Возобновить работу парсера."""
+    data = user_data.get(str(message.from_user.id))
+    if not data:
+        await message.answer("Данные не найдены.")
+        return
+    parsers = [
+        (idx, p)
+        for idx, p in enumerate(data.get('parsers', []))
+        if p.get('paused')
+    ]
+    if not parsers:
+        await message.answer("Нет парсеров на паузе.")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for idx, p in parsers:
+        name = p.get('name', f'Парсер {idx+1}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'resume_{idx}'))
+    await message.answer("Выберите парсер для запуска:", reply_markup=kb)
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('resume_'))
+async def cb_resume_parser(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[1])
+    user_id = call.from_user.id
+    data = user_data.get(str(user_id))
+    if data and 0 <= idx < len(data.get('parsers', [])):
+        parser = data['parsers'][idx]
+        parser['paused'] = False
+        save_user_data(user_data)
+        await start_monitor(user_id, parser)
+        await call.message.answer("Парсер запущен.")
+    await call.answer()
+
+
 @dp.message_handler(commands=['delete_parser'])
 async def cmd_delete_parser(message: types.Message):
     """Начать процесс удаления парсера."""
@@ -467,10 +543,10 @@ async def cmd_delete_parser(message: types.Message):
     parsers = [
         (idx, p)
         for idx, p in enumerate(data.get('parsers', []))
-        if not p.get('paid')
+        if p.get('paused')
     ]
     if not parsers:
-        await message.answer("Нет доступных парсеров для удаления.")
+        await message.answer("Нет парсеров на паузе для удаления.")
         return
     kb = types.InlineKeyboardMarkup(row_width=1)
     for idx, p in parsers:
@@ -505,8 +581,8 @@ async def cb_delp_confirm(call: types.CallbackQuery):
     data = user_data.get(str(user_id))
     if data and 0 <= idx < len(data.get('parsers', [])):
         parser = data['parsers'][idx]
-        if parser.get('paid'):
-            await call.message.answer("Оплаченный парсер нельзя удалить.")
+        if not parser.get('paused'):
+            await call.message.answer("Парсер нужно поставить на паузу перед удалением.")
             await call.answer()
             return
         stop_monitor(user_id, parser)
@@ -627,6 +703,16 @@ async def cb_menu_profile(call: types.CallbackQuery):
         plan_name = 'Нет активной подписки'
         paid_to = '—'
     rec_status = '🔁' if data.get('recurring') else ''
+    balance = data.get('balance', 0)
+    total_daily_cost = sum(
+        p.get('daily_cost', 0) for p in data.get('parsers', []) if not p.get('paused')
+    )
+    if total_daily_cost > 0:
+        days = int(balance / total_daily_cost)
+        block_date = (datetime.utcnow() + timedelta(days=days)).strftime('%Y-%m-%d')
+    else:
+        days = '∞'
+        block_date = '—'
     text = t(
         'menu_profile',
         user_id=call.from_user.id,
@@ -634,6 +720,10 @@ async def cb_menu_profile(call: types.CallbackQuery):
         plan_name=plan_name,
         paid_to=paid_to,
         rec_status=rec_status,
+        block_date=block_date,
+        block_days=days,
+        balance=balance,
+        daily_cost_total=round(total_daily_cost, 2),
         promo_code=data.get('promo_code', 'N/A'),
         ref_count=data.get('ref_count', 0),
         ref_active_users=data.get('ref_active_users', 0),
@@ -1023,7 +1113,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
             'parsers': saved.get('parsers', [])
         }
         for p in user_clients[user_id]['parsers']:
-            await start_monitor(user_id, p)
+            if not p.get('paused'):
+                await start_monitor(user_id, p)
 
     parsers = user_data.setdefault(str(user_id), {}).setdefault('parsers', [])
     parser_id = len(parsers) + 1
@@ -1035,6 +1126,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         'exclude_keywords': [],
         'account': '',
         'results': [],
+        'paused': False,
+        'daily_cost': PRO_DAILY_COST,
     }
     parsers.append(parser)
     info = user_clients.setdefault(user_id, info or {})
@@ -1079,7 +1172,8 @@ async def start_login(message: types.Message, state: FSMContext):
                     'parsers': saved.get('parsers', [])
                 }
                 for p in user_clients[user_id]['parsers']:
-                    await start_monitor(user_id, p)
+                    if not p.get('paused'):
+                        await start_monitor(user_id, p)
                 if user_clients[user_id]['parsers']:
                     await message.answer("✅ Найдены сохранённые парсеры. Мониторинг запущен.")
                     return
@@ -1321,6 +1415,8 @@ async def get_parser_account(message: types.Message, state: FSMContext):
         'keywords': keywords,
         'account': account,
         'results': [],
+        'paused': False,
+        'daily_cost': PRO_DAILY_COST,
     }
     info = user_clients.setdefault(user_id, {})
     info.setdefault('parsers', []).append(parser)
@@ -1360,7 +1456,8 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
     stop_monitor(user_id, parser)
     parser['chats'] = chat_ids
     save_user_data(user_data)
-    await start_monitor(user_id, parser)
+    if not parser.get('paused'):
+        await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Чаты обновлены.")
 
@@ -1378,7 +1475,8 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
     stop_monitor(user_id, parser)
     parser['keywords'] = keywords
     save_user_data(user_data)
-    await start_monitor(user_id, parser)
+    if not parser.get('paused'):
+        await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Ключевые слова обновлены.")
 
@@ -1393,7 +1491,8 @@ async def edit_exclude_handler(message: types.Message, state: FSMContext):
     stop_monitor(user_id, parser)
     parser['exclude_keywords'] = words
     save_user_data(user_data)
-    await start_monitor(user_id, parser)
+    if not parser.get('paused'):
+        await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Исключающие слова обновлены.")
 
@@ -1422,7 +1521,8 @@ async def edit_account_handler(message: types.Message, state: FSMContext):
     stop_monitor(user_id, parser)
     parser['account'] = account
     save_user_data(user_data)
-    await start_monitor(user_id, parser)
+    if not parser.get('paused'):
+        await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Аккаунт обновлён.")
 
