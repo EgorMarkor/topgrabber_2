@@ -290,6 +290,12 @@ class EditParserStates(StatesGroup):
     waiting_account = State()
 
 
+class ExpandProStates(StatesGroup):
+    """States for expanding PRO plan."""
+    waiting_chats = State()
+    waiting_confirm = State()
+
+
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     """Отправить справочную информацию."""
@@ -546,7 +552,110 @@ async def cb_setup_list(call: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == 'setup_pay')
 async def cb_setup_pay(call: types.CallbackQuery, state: FSMContext):
-    await cb_tariff_pro(call, state)
+    """Show list of parsers for payment actions."""
+    data = user_data.get(str(call.from_user.id))
+    if not data or not data.get('parsers'):
+        await call.message.answer("Парсеры не настроены.")
+        await call.answer()
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for idx, p in enumerate(data.get('parsers'), 1):
+        name = p.get('name', f'Парсер {idx}')
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'pay_select_{idx-1}'))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="menu_setup"))
+    await call.message.answer("Выберите парсер:", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pay_select_'))
+async def cb_pay_select(call: types.CallbackQuery):
+    """Show payment options for selected parser."""
+    idx = int(call.data.split('_')[2])
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("Продлить подписку", callback_data=f'pay_renew_{idx}'),
+        types.InlineKeyboardButton("Расширить Pro", callback_data=f'pay_expand_{idx}'),
+        types.InlineKeyboardButton("Перейти на Infinity", callback_data=f'pay_infinity_{idx}'),
+        types.InlineKeyboardButton("🔙 Назад", callback_data='setup_pay'),
+    )
+    await call.message.answer("Выберите действие:", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pay_renew_'))
+async def cb_pay_renew(call: types.CallbackQuery, state: FSMContext):
+    """Renew PRO subscription."""
+    await _process_tariff_pro(call.message, state)
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pay_expand_'))
+async def cb_pay_expand(call: types.CallbackQuery, state: FSMContext):
+    """Start process to expand PRO plan chats."""
+    idx = int(call.data.split('_')[2])
+    await state.update_data(expand_idx=idx)
+    await call.message.answer("Сколько чатов вам нужно?")
+    await ExpandProStates.waiting_chats.set()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith('pay_infinity_'))
+async def cb_pay_infinity(call: types.CallbackQuery):
+    """Inform about INFINITY plan."""
+    await call.message.answer(
+        "Тариф INFINITY — 149 990 ₽/мес. Неограниченные чаты и слова, персональный аккаунт-менеджер.\n"
+        "Для подключения напишите @TopGrabberSupport"
+    )
+    await call.answer()
+
+
+@dp.message_handler(state=ExpandProStates.waiting_chats)
+async def expand_pro_chats(message: types.Message, state: FSMContext):
+    """Handle number of chats for PRO expansion."""
+    text = message.text.strip()
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("Введите количество чатов числом")
+        return
+    chats = int(text)
+    price = 1990 + max(0, chats - 5) * 490
+    await state.update_data(chats=chats, price=price)
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("✅ Подтвердить", callback_data='expand_confirm'),
+        types.InlineKeyboardButton("❌ Отмена", callback_data='expand_cancel'),
+        types.InlineKeyboardButton("🔙 Назад", callback_data='expand_back'),
+    )
+    await message.answer(
+        f"Стоимость тарифа PRO на {chats} чатов составит {price} ₽/мес. Подтвердить оплату?",
+        reply_markup=kb,
+    )
+    await ExpandProStates.waiting_confirm.set()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'expand_confirm', state=ExpandProStates.waiting_confirm)
+async def cb_expand_confirm(call: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    price = data.get('price')
+    chats = data.get('chats')
+    await call.message.answer(
+        f"Для расширения до {chats} чатов необходимо оплатить {price} ₽. \nСвяжитесь с поддержкой: @TopGrabberSupport",
+    )
+    await state.finish()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'expand_cancel', state=ExpandProStates.waiting_confirm)
+async def cb_expand_cancel(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Действие отменено.")
+    await state.finish()
+    await call.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == 'expand_back', state=ExpandProStates.waiting_confirm)
+async def cb_expand_back(call: types.CallbackQuery, state: FSMContext):
+    await call.message.answer("Сколько чатов вам нужно?")
+    await ExpandProStates.waiting_chats.set()
+    await call.answer()
 
 
 @dp.callback_query_handler(lambda c: c.data == 'menu_export')
