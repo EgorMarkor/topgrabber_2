@@ -89,7 +89,8 @@ def load_user_data():
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
-                    p.setdefault('account', '')
+                    p.setdefault('api_id', '')
+                    p.setdefault('api_hash', '')
             return data
         except Exception:
             logging.exception("Failed to load user data")
@@ -279,7 +280,8 @@ class ParserStates(StatesGroup):
     waiting_name = State()
     waiting_chats = State()
     waiting_keywords = State()
-    waiting_account = State()
+    waiting_account_api_id = State()
+    waiting_account_api_hash = State()
 
 
 class EditParserStates(StatesGroup):
@@ -287,7 +289,8 @@ class EditParserStates(StatesGroup):
     waiting_keywords = State()
     waiting_exclude = State()
     waiting_name = State()
-    waiting_account = State()
+    waiting_account_api_id = State()
+    waiting_account_api_hash = State()
 
 
 @dp.message_handler(commands=["help"])
@@ -327,9 +330,9 @@ async def cmd_info(message: types.Message):
         name = p.get('name', f'Парсер {idx}')
         chats = p.get('chats') or []
         kws = p.get('keywords') or []
-        account = p.get('account', '')
+        api_id = p.get('api_id', '')
         lines.append(
-            f"#{idx} {name}\nАккаунт: {account}\nЧаты: {chats}\nКлючевые слова: {', '.join(kws)}"
+            f"#{idx} {name}\nAPI ID: {api_id}\nЧаты: {chats}\nКлючевые слова: {', '.join(kws)}"
         )
     await message.answer("\n\n".join(lines))
 
@@ -384,7 +387,7 @@ def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
     chat_count = len(parser.get('chats', []))
     include_count = len(parser.get('keywords', []))
     exclude_count = len(parser.get('exclude_keywords', []))
-    account_label = parser.get('account') or 'не привязан'
+    account_label = parser.get('api_id') or 'не привязан'
     data = user_data.get(str(user_id), {})
     plan_name = 'PRO'
     if data.get('subscription_expiry'):
@@ -971,10 +974,8 @@ async def cb_edit_name(call: types.CallbackQuery, state: FSMContext):
 async def cb_edit_account(call: types.CallbackQuery, state: FSMContext):
     idx = int(call.data.split('_')[2]) - 1
     await state.update_data(edit_idx=idx)
-    await call.message.answer(
-        "Введите аккаунт для привязки (например, @username):"
-    )
-    await EditParserStates.waiting_account.set()
+    await call.message.answer("Введите api_id аккаунта-парсера:")
+    await EditParserStates.waiting_account_api_id.set()
     await call.answer()
 
 
@@ -1033,7 +1034,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         'chats': [],
         'keywords': [],
         'exclude_keywords': [],
-        'account': '',
+        'api_id': '',
+        'api_hash': '',
         'results': [],
     }
     parsers.append(parser)
@@ -1290,8 +1292,8 @@ async def _process_keywords(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(keywords=keywords)
-    await message.answer("Укажите аккаунт для привязки парсера (например, @username):")
-    await ParserStates.waiting_account.set()
+    await message.answer("Укажите api_id аккаунта-парсера:")
+    await ParserStates.waiting_account_api_id.set()
 
 
 @dp.message_handler(state=AuthStates.waiting_keywords)
@@ -1304,11 +1306,23 @@ async def get_keywords_parser(message: types.Message, state: FSMContext):
     await _process_keywords(message, state)
 
 
-@dp.message_handler(state=ParserStates.waiting_account)
-async def get_parser_account(message: types.Message, state: FSMContext):
-    account = message.text.strip()
-    user_id = message.from_user.id
+@dp.message_handler(state=ParserStates.waiting_account_api_id)
+async def get_parser_api_id(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("⚠️ api_id должен быть числом. Попробуйте ещё раз:")
+        return
+    await state.update_data(api_id=int(text))
+    await message.answer("Введите api_hash аккаунта-парсера:")
+    await ParserStates.waiting_account_api_hash.set()
+
+
+@dp.message_handler(state=ParserStates.waiting_account_api_hash)
+async def get_parser_api_hash(message: types.Message, state: FSMContext):
+    api_hash = message.text.strip()
     data = await state.get_data()
+    api_id = data.get('api_id')
+    user_id = message.from_user.id
     chat_ids = data.get('chat_ids')
     keywords = data.get('keywords')
     name = data.get(
@@ -1319,7 +1333,8 @@ async def get_parser_account(message: types.Message, state: FSMContext):
         'name': name,
         'chats': chat_ids,
         'keywords': keywords,
-        'account': account,
+        'api_id': api_id,
+        'api_hash': api_hash,
         'results': [],
     }
     info = user_clients.setdefault(user_id, {})
@@ -1412,15 +1427,28 @@ async def edit_name_handler(message: types.Message, state: FSMContext):
     await message.answer("✅ Название обновлено.")
 
 
-@dp.message_handler(state=EditParserStates.waiting_account)
-async def edit_account_handler(message: types.Message, state: FSMContext):
+@dp.message_handler(state=EditParserStates.waiting_account_api_id)
+async def edit_account_api_id(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit():
+        await message.answer("⚠️ api_id должен быть числом. Попробуйте ещё раз:")
+        return
+    await state.update_data(api_id=int(text))
+    await message.answer("Введите новый api_hash аккаунта-парсера:")
+    await EditParserStates.waiting_account_api_hash.set()
+
+
+@dp.message_handler(state=EditParserStates.waiting_account_api_hash)
+async def edit_account_api_hash(message: types.Message, state: FSMContext):
     data = await state.get_data()
     idx = data.get('edit_idx')
-    account = message.text.strip()
+    api_id = data.get('api_id')
+    api_hash = message.text.strip()
     user_id = message.from_user.id
     parser = user_data[str(user_id)]['parsers'][idx]
     stop_monitor(user_id, parser)
-    parser['account'] = account
+    parser['api_id'] = api_id
+    parser['api_hash'] = api_hash
     save_user_data(user_data)
     await start_monitor(user_id, parser)
     await state.finish()
