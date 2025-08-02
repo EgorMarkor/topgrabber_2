@@ -1525,8 +1525,7 @@ async def edit_name_handler(message: types.Message, state: FSMContext):
     new_name = message.text.strip()
     user_id = message.from_user.id
     parser = user_data[str(user_id)]['parsers'][idx]
-    parser_id = parser.get('id', idx + 1)
-    parser['name'] = f"{new_name}_{parser_id}"
+    parser['name'] = new_name
     save_user_data(user_data)
     await state.finish()
     await message.answer("✅ Название обновлено.")
