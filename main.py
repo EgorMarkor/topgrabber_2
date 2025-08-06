@@ -89,6 +89,7 @@ def load_user_data():
                 u.setdefault('reminder1_sent', False)
                 u.setdefault('inactive_notified', False)
                 u.setdefault('used_promos', [])
+                u.setdefault('chat_limit', CHAT_LIMIT)
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
@@ -115,15 +116,22 @@ def save_user_data(data):
 
 user_data = load_user_data()  # persistent data: {str(user_id): {...}}
 
-def create_pro_payment(user_id: int):
+
+def get_user_data_entry(user_id: int):
+    data = user_data.setdefault(str(user_id), {})
+    data.setdefault('chat_limit', CHAT_LIMIT)
+    return data
+
+
+def create_payment(user_id: int, amount: str, description: str):
     if not (YOOKASSA_SHOP_ID and YOOKASSA_TOKEN):
         return None, None
     try:
         payment = Payment.create(
             {
-                "amount": {"value": PRO_PRICE, "currency": "RUB"},
+                "amount": {"value": amount, "currency": "RUB"},
                 "confirmation": {"type": "redirect", "return_url": RETURN_URL},
-                "description": f"Подписка PRO для пользователя {user_id}",
+                "description": description,
             },
             str(uuid.uuid4()),
         )
@@ -132,7 +140,12 @@ def create_pro_payment(user_id: int):
         logging.exception("Failed to create payment")
     return None, None
 
-def check_pro_payment(payment_id: str):
+
+def create_pro_payment(user_id: int):
+    return create_payment(user_id, PRO_PRICE, f"Подписка PRO для пользователя {user_id}")
+
+
+def check_payment(payment_id: str):
     try:
         payment = Payment.find_one(payment_id)
         return payment.status
@@ -140,10 +153,31 @@ def check_pro_payment(payment_id: str):
         logging.exception("Failed to check payment")
     return None
 
+
+async def wait_payment_and_activate(user_id: int, payment_id: str, chats: int):
+    """Poll payment status and activate subscription on success."""
+    for _ in range(60):  # up to 5 minutes
+        status = check_payment(payment_id)
+        if status == 'succeeded':
+            data = get_user_data_entry(user_id)
+            expiry = int((datetime.utcnow() + timedelta(days=30)).timestamp())
+            data['subscription_expiry'] = expiry
+            data['chat_limit'] = chats
+            data.pop('payment_id', None)
+            save_user_data(user_data)
+            await bot.send_message(user_id, t('payment_success'))
+            return
+        if status in ('canceled', 'expired'):
+            data = get_user_data_entry(user_id)
+            data.pop('payment_id', None)
+            save_user_data(user_data)
+            await bot.send_message(user_id, t('payment_failed', status=status))
+            return
+        await asyncio.sleep(5)
+    await bot.send_message(user_id, t('payment_failed', status='timeout'))
+
 def check_subscription(user_id: int):
-    data = user_data.get(str(user_id))
-    if not data:
-        return
+    data = get_user_data_entry(user_id)
     exp = data.get('subscription_expiry', 0)
     now = int(datetime.utcnow().timestamp())
     days_left = (exp - now) // 86400
@@ -310,7 +344,7 @@ async def cmd_help(message: types.Message):
 
 @dp.message_handler(commands=['enable_recurring'])
 async def enable_recurring(message: types.Message):
-    data = user_data.setdefault(str(message.from_user.id), {})
+    data = get_user_data_entry(message.from_user.id)
     data['recurring'] = True
     save_user_data(user_data)
     await message.answer(t('recurring_enabled'))
@@ -318,7 +352,7 @@ async def enable_recurring(message: types.Message):
 
 @dp.message_handler(commands=['disable_recurring'])
 async def disable_recurring(message: types.Message):
-    data = user_data.setdefault(str(message.from_user.id), {})
+    data = get_user_data_entry(message.from_user.id)
     data['recurring'] = False
     save_user_data(user_data)
     await message.answer(t('recurring_disabled'))
@@ -400,13 +434,13 @@ def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
     include_count = len(parser.get('keywords', []))
     exclude_count = len(parser.get('exclude_keywords', []))
     account_label = parser.get('api_id') or 'не привязан'
-    data = user_data.get(str(user_id), {})
+    data = get_user_data_entry(user_id)
     plan_name = 'PRO'
     if data.get('subscription_expiry'):
         paid_to = datetime.utcfromtimestamp(data['subscription_expiry']).strftime('%Y-%m-%d')
     else:
         paid_to = '—'
-    chat_limit = f'/{CHAT_LIMIT}' if plan_name == 'PRO' else ''
+    chat_limit = f"/{data.get('chat_limit', CHAT_LIMIT)}" if plan_name == 'PRO' else ''
     status_emoji = '🟢' if parser.get('handler') else '⏸'
     status_text = 'Активен' if parser.get('handler') else 'Остановлен'
     if created:
@@ -431,7 +465,7 @@ def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
     check_subscription(message.from_user.id)
-    data = user_data.setdefault(str(message.from_user.id), {})
+    data = get_user_data_entry(message.from_user.id)
     if not data.get('started'):
         data['started'] = True
         save_user_data(user_data)
@@ -650,9 +684,22 @@ async def cb_expand_confirm(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     price = data.get('price')
     chats = data.get('chats')
-    await call.message.answer(
-        f"Для расширения до {chats} чатов необходимо оплатить {price} ₽. \nСвяжитесь с поддержкой: @TopGrabberSupport",
+    user_id = call.from_user.id
+    payment_id, url = create_payment(
+        user_id,
+        f"{price:.2f}",
+        f"Расширение PRO до {chats} чатов для пользователя {user_id}",
     )
+    if not payment_id:
+        await call.message.answer("Не удалось создать платёж. Попробуйте позже.")
+    else:
+        entry = get_user_data_entry(user_id)
+        entry['payment_id'] = payment_id
+        save_user_data(user_data)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
+        await call.message.answer("Нажмите кнопку для оплаты.", reply_markup=kb)
+        asyncio.create_task(wait_payment_and_activate(user_id, payment_id, chats))
     await state.finish()
     await call.answer()
 
@@ -799,8 +846,8 @@ async def cb_profile_delete_card(call: types.CallbackQuery):
 
 async def _process_tariff_pro(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    data = user_data.get(str(user_id))
-    if data and data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
+    data = get_user_data_entry(user_id)
+    if data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
         await cmd_add_parser(message, state)
         return
 
@@ -828,7 +875,7 @@ async def cmd_tariff_pro(message: types.Message, state: FSMContext):
 async def promo_entered(message: types.Message, state: FSMContext):
     code = message.text.strip().upper()
     user_id = message.from_user.id
-    data = user_data.setdefault(str(user_id), {})
+    data = get_user_data_entry(user_id)
     used_promos = data.setdefault('used_promos', [])
     if code in used_promos:
         await message.answer(
@@ -858,13 +905,13 @@ async def promo_entered(message: types.Message, state: FSMContext):
     if not payment_id:
         await message.answer("Не удалось создать платёж. Попробуйте позже.")
     else:
-        user_data.setdefault(str(user_id), {})['payment_id'] = payment_id
+        data['payment_id'] = payment_id
         save_user_data(user_data)
         kb = types.InlineKeyboardMarkup()
-        kb.add(types.InlineKeyboardButton("Оплатить", url=url))
-        await message.answer(
-            "Для активации тарифа оплатите по ссылке и затем используйте /check_payment.",
-            reply_markup=kb,
+        kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
+        await message.answer("Нажмите кнопку для оплаты.", reply_markup=kb)
+        asyncio.create_task(
+            wait_payment_and_activate(user_id, payment_id, data.get('chat_limit', CHAT_LIMIT))
         )
     await state.finish()
 
@@ -962,20 +1009,20 @@ async def cmd_export(message: types.Message):
 @dp.message_handler(commands=['check_payment'])
 async def cmd_check_payment(message: types.Message):
     user_id = message.from_user.id
-    data = user_data.get(str(user_id))
-    payment_id = data.get('payment_id') if data else None
+    data = get_user_data_entry(user_id)
+    payment_id = data.get('payment_id')
     if not payment_id:
-        await message.answer("Платёж не найден. Используйте /tariff_pro для оформления.")
+        await message.answer("Платёж не найден.")
         return
-    status = check_pro_payment(payment_id)
+    status = check_payment(payment_id)
     if status == 'succeeded':
         expiry = int((datetime.utcnow() + timedelta(days=30)).timestamp())
         data['subscription_expiry'] = expiry
         data.pop('payment_id', None)
         save_user_data(user_data)
-        await message.answer("Оплата подтверждена! Используйте /login для авторизации.")
+        await message.answer(t('payment_success'))
     else:
-        await message.answer(f"Платёж не завершён. Текущий статус: {status}")
+        await message.answer(t('payment_failed', status=status))
 
 async def send_all_results(user_id: int):
     data = user_data.get(str(user_id))
@@ -1147,7 +1194,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         for p in user_clients[user_id]['parsers']:
             await start_monitor(user_id, p)
 
-    parsers = user_data.setdefault(str(user_id), {}).setdefault('parsers', [])
+    data = get_user_data_entry(user_id)
+    parsers = data.setdefault('parsers', [])
     parser_id = len(parsers) + 1
     parser = {
         'id': parser_id,
@@ -1283,6 +1331,7 @@ async def get_phone(message: types.Message, state: FSMContext):
     saved.setdefault('reminder3_sent', False)
     saved.setdefault('reminder1_sent', False)
     saved.setdefault('inactive_notified', False)
+    saved.setdefault('chat_limit', CHAT_LIMIT)
     user_data[str(user_id)] = saved
     save_user_data(user_data)
     await state.update_data(phone=phone)
@@ -1386,8 +1435,9 @@ async def _process_chats(message: types.Message, state: FSMContext, next_state):
         await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
         return None
 
-    if len(chat_ids) > CHAT_LIMIT:
-        await message.answer(f"⚠️ Можно указать не более {CHAT_LIMIT} чатов.")
+    limit = get_user_data_entry(user_id).get('chat_limit', CHAT_LIMIT)
+    if len(chat_ids) > limit:
+        await message.answer(f"⚠️ Можно указать не более {limit} чатов.")
         return None
 
     await state.update_data(chat_ids=chat_ids)
@@ -1454,7 +1504,7 @@ async def get_parser_api_hash(message: types.Message, state: FSMContext):
     keywords = data.get('keywords')
     name = data.get(
         'parser_name',
-        f"Парсер {len(user_data.get(str(user_id), {}).get('parsers', [])) + 1}"
+        f"Парсер {len(get_user_data_entry(user_id).get('parsers', [])) + 1}"
     )
     parser = {
         'name': name,
@@ -1499,8 +1549,9 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
         await message.answer("⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
         return
 
-    if len(chat_ids) > CHAT_LIMIT:
-        await message.answer(f"⚠️ Можно указать не более {CHAT_LIMIT} чатов.")
+    limit = get_user_data_entry(user_id).get('chat_limit', CHAT_LIMIT)
+    if len(chat_ids) > limit:
+        await message.answer(f"⚠️ Можно указать не более {limit} чатов.")
         return
     parser = user_data[str(user_id)]['parsers'][idx]
     stop_monitor(user_id, parser)
