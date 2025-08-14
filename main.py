@@ -33,10 +33,52 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
+API_TOKEN2 = "8496643232:AAHuSYuFH8DyvDe8sCNnhpYxenhX6Abs29"
+bot2 = Bot(token=API_TOKEN2)
+storage2 = MemoryStorage()
+dp2 = Dispatcher(bot2, storage=storage2)
+
 # ЮKassa configuration
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
-PRO_PRICE = "1990.00"
+# ===== New billing constants =====
+PRO_MONTHLY_RUB = 1490.00          # Базовый PRO «за парсер» до 5 чатов
+EXTRA_CHAT_MONTHLY_RUB = 490.00    # За каждый чат сверх 5
+DAYS_IN_MONTH = 30
+
+def _round2(x: float) -> float:
+    return float(f"{x:.2f}")
+
+def calc_parser_daily_cost(parser: dict) -> float:
+    """Стоимость парсера в сутки исходя из числа чатов."""
+    chats = len(parser.get('chats', []))
+    base = PRO_MONTHLY_RUB / DAYS_IN_MONTH
+    extras = max(0, chats - 5) * (EXTRA_CHAT_MONTHLY_RUB / DAYS_IN_MONTH)
+    return _round2(base + extras)
+
+def total_daily_cost(user_id: int) -> float:
+    """Сумма в сутки по всем активным парсерам пользователя."""
+    data = user_data.get(str(user_id), {})
+    total = 0.0
+    for p in data.get('parsers', []):
+        if p.get('status', 'paused') == 'active':
+            total += p.get('daily_price') or calc_parser_daily_cost(p)
+    return _round2(total)
+
+def predict_block_date(user_id: int) -> tuple[str, int]:
+    """
+    Возвращает (дата_строкой, целых_дней) когда баланс иссякнет,
+    исходя из текущей ежедневной суммы.
+    """
+    data = user_data.get(str(user_id), {})
+    bal = float(data.get('balance', 0))
+    per_day = total_daily_cost(user_id)
+    if per_day <= 0 or bal <= 0:
+        return "—", 0
+    days = int(bal // per_day)
+    dt = (datetime.utcnow() + timedelta(days=days)).strftime('%d.%m.%Y')
+    return dt, days
+
 RETURN_URL = "https://t.me/TOPGrabber_bot"
 if YOOKASSA_SHOP_ID and YOOKASSA_TOKEN:
     Configuration.account_id = YOOKASSA_SHOP_ID
@@ -90,11 +132,19 @@ def load_user_data():
                 u.setdefault('inactive_notified', False)
                 u.setdefault('used_promos', [])
                 u.setdefault('chat_limit', CHAT_LIMIT)
+                u.setdefault('balance', 0.0)                 # новый кошелёк пользователя
+                u.setdefault('billing_enabled', True)        # флаг на будущее
+                # Старые поля подписки можно оставить — они не будут использоваться
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
                     p.setdefault('api_id', '')
                     p.setdefault('api_hash', '')
+                    p.setdefault('status', 'paused')             # 'active' | 'paused'
+                    p.setdefault('daily_price', 0.0)             # кэш рассчётной цены/сутки
+                    # Актуализируем daily_price, если уже известны чаты
+                    if not p.get('daily_price'):
+                        p['daily_price'] = calc_parser_daily_cost(p)
             return data
         except Exception:
             logging.exception("Failed to load user data")
@@ -120,6 +170,7 @@ user_data = load_user_data()  # persistent data: {str(user_id): {...}}
 def get_user_data_entry(user_id: int):
     data = user_data.setdefault(str(user_id), {})
     data.setdefault('chat_limit', CHAT_LIMIT)
+    data.setdefault('balance', 0.0)
     return data
 
 
@@ -141,8 +192,33 @@ def create_payment(user_id: int, amount: str, description: str):
     return None, None
 
 
+def create_topup_payment(user_id: int, amount_rub: float):
+    amount = f"{amount_rub:.2f}"
+    return create_payment(user_id, amount, f"Пополнение баланса {user_id} на {amount} ₽")
+
+async def wait_topup_and_credit(user_id: int, payment_id: str, amount: float):
+    for _ in range(60):
+        status = check_payment(payment_id)
+        if status == 'succeeded':
+            data = get_user_data_entry(user_id)
+            data['balance'] = _round2(float(data.get('balance', 0)) + amount)
+            data.pop('payment_id', None)
+            save_user_data(user_data)
+            await bot.send_message(user_id, f"✅ Оплата прошла. Баланс пополнен на {amount:.2f} ₽.")
+            return
+        if status in ('canceled', 'expired'):
+            data = get_user_data_entry(user_id)
+            data.pop('payment_id', None)
+            save_user_data(user_data)
+            await bot.send_message(user_id, t('payment_failed', status=status))
+            return
+        await asyncio.sleep(5)
+    await bot.send_message(user_id, t('payment_failed', status='timeout'))
+
+
+
 def create_pro_payment(user_id: int):
-    return create_payment(user_id, PRO_PRICE, f"Подписка PRO для пользователя {user_id}")
+    return create_payment(user_id, PRO_MONTHLY_RUB, f"Подписка PRO для пользователя {user_id}")
 
 
 def check_payment(payment_id: str):
@@ -226,6 +302,8 @@ HELP_TEXT = (
 
 
 async def start_monitor(user_id: int, parser: dict):
+    if parser.get('status', 'paused') != 'active':
+        return
     info = user_clients.get(user_id)
     if not info:
         return
@@ -256,7 +334,7 @@ async def start_monitor(user_id: int, parser: dict):
                 if chat_username:
                     link = f"https://t.me/{chat_username}/{event.id}"
                 preview = html.escape(text[:400])
-                await bot.send_message(
+                await bot2.send_message(
                     user_id,
                     f"🔔 Найдено '{html.escape(kw)}' в чате '{html.escape(title)}'\n"
                     f"Username: {html.escape(sender_name)}\n"
@@ -297,6 +375,20 @@ def stop_monitor(user_id: int, parser: dict):
             pass
     parser.pop('handler', None)
     parser.pop('event', None)
+
+def pause_parser(user_id: int, parser: dict):
+    """Ставит парсер на паузу и снимает обработчики."""
+    parser['status'] = 'paused'
+    stop_monitor(user_id, parser)
+    save_user_data(user_data)
+
+async def resume_parser(user_id: int, parser: dict):
+    """Возобновляет парсер и пересчитывает цену."""
+    parser['status'] = 'active'
+    parser['daily_price'] = calc_parser_daily_cost(parser)
+    save_user_data(user_data)
+    await start_monitor(user_id, parser)
+
 
 # Определение состояний FSM
 class AuthStates(StatesGroup):
@@ -400,31 +492,155 @@ def main_menu_keyboard() -> types.InlineKeyboardMarkup:
 
 
 def parser_settings_keyboard(idx: int) -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton(
-            "🛠 Изменить название", callback_data=f"edit_name_{idx}"
-        ),
-        types.InlineKeyboardButton(
-            "📂 Изменить чаты", callback_data=f"edit_chats_{idx}"
-        ),
-        types.InlineKeyboardButton(
-            "📂 Изменить слова", callback_data=f"edit_keywords_{idx}"
-        ),
-        types.InlineKeyboardButton(
-            "📂 Изменить искл-слова", callback_data=f"edit_exclude_{idx}"
-        ),
-        types.InlineKeyboardButton(
-            "🛠 Изменить аккаунт-парсер", callback_data=f"edit_account_{idx}"
-        ),
-        types.InlineKeyboardButton(
-            "💳 Тариф и оплата", callback_data=f"edit_tariff_{idx}"
-        ),
+        types.InlineKeyboardButton("▶️ Запустить", callback_data=f"parser_resume_{idx}"),
+        types.InlineKeyboardButton("⏸ Пауза", callback_data=f"parser_pause_{idx}"),
     )
     kb.add(
-        types.InlineKeyboardButton("🔙 Назад", callback_data="back_main")
+        types.InlineKeyboardButton("🛠 Изменить название", callback_data=f"edit_name_{idx}"),
+        types.InlineKeyboardButton("📂 Изменить чаты", callback_data=f"edit_chats_{idx}"),
     )
+    kb.add(
+        types.InlineKeyboardButton("📂 Изменить слова", callback_data=f"edit_keywords_{idx}"),
+        types.InlineKeyboardButton("📂 Изменить искл-слова", callback_data=f"edit_exclude_{idx}"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🛠 Изменить аккаунт-парсер", callback_data=f"edit_account_{idx}"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🗑 Удалить (только на паузе)", callback_data=f"parser_delete_{idx}"),
+    )
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
     return kb
+
+
+class TopUpStates(StatesGroup):
+    waiting_amount = State()
+    
+
+@dp.callback_query_handler(lambda c: c.data.startswith('parser_pause_'))
+async def cb_parser_pause(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[2]) - 1
+    user_id = call.from_user.id
+    data = user_data.get(str(user_id), {})
+    if not data or idx < 0 or idx >= len(data.get('parsers', [])):
+        await call.answer("Не найдено", show_alert=True)
+        return
+    p = data['parsers'][idx]
+    if p.get('status') == 'paused':
+        await call.answer("Уже на паузе")
+        return
+    pause_parser(user_id, p)
+    await call.message.answer("⏸ Парсер поставлен на паузу.")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('parser_resume_'))
+async def cb_parser_resume(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[2]) - 1
+    user_id = call.from_user.id
+    data = user_data.get(str(user_id), {})
+    if not data or idx < 0 or idx >= len(data.get('parsers', [])):
+        await call.answer("Не найдено", show_alert=True)
+        return
+    # Проверим баланс хотя бы на 1 день
+    per_day = total_daily_cost(user_id)  # до резюма равен сумме активных; здесь ок
+    # Допускаем резюмирование даже без денег — спишется ночью; можно ужесточить при желании
+    await resume_parser(user_id, data['parsers'][idx])
+    await call.message.answer("▶️ Парсер запущен.")
+
+@dp.callback_query_handler(lambda c: c.data.startswith('parser_delete_'))
+async def cb_parser_delete(call: types.CallbackQuery):
+    idx = int(call.data.split('_')[2]) - 1
+    user_id = call.from_user.id
+    data = user_data.get(str(user_id), {})
+    if not data or idx < 0 or idx >= len(data.get('parsers', [])):
+        await call.answer("Не найдено", show_alert=True)
+        return
+    p = data['parsers'][idx]
+    if p.get('status') != 'paused':
+        await call.message.answer("Удалять можно только парсеры на паузе. Сначала нажмите ⏸ Пауза.")
+        await call.answer()
+        return
+    stop_monitor(user_id, p)
+    await send_parser_results(user_id, idx)  # как и раньше — отдадим CSV перед удалением
+    data['parsers'].pop(idx)
+    save_user_data(user_data)
+    await call.message.answer("🗑 Парсер удалён.")
+    await call.answer()
+
+
+
+@dp.message_handler(commands=['topup'])
+async def cmd_topup(message: types.Message, state: FSMContext):
+    await message.answer("Введите сумму пополнения (минимум 300 ₽):")
+    await TopUpStates.waiting_amount.set()
+
+@dp.message_handler(state=TopUpStates.waiting_amount)
+async def topup_amount(message: types.Message, state: FSMContext):
+    text = message.text.replace(',', '.').strip()
+    try:
+        amount = float(text)
+    except ValueError:
+        await message.answer("Введите число, например 500 или 1200.50")
+        return
+    if amount < 300:
+        await message.answer("Минимальная сумма пополнения — 300 ₽. Введите другую сумму:")
+        return
+    user_id = message.from_user.id
+    payment_id, url = create_topup_payment(user_id, amount)
+    if not payment_id:
+        await message.answer("Не удалось создать платёж. Попробуйте позже.")
+    else:
+        entry = get_user_data_entry(user_id)
+        entry['payment_id'] = payment_id
+        save_user_data(user_data)
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
+        await message.answer("Нажмите кнопку для оплаты.", reply_markup=kb)
+        asyncio.create_task(wait_topup_and_credit(user_id, payment_id, amount))
+    await state.finish()
+
+
+async def bill_user_daily(user_id: int):
+    data = user_data.get(str(user_id), {})
+    if not data:
+        return
+    per_day = total_daily_cost(user_id)
+    if per_day <= 0:
+        return
+    bal = float(data.get('balance', 0))
+    if bal >= per_day:
+        data['balance'] = _round2(bal - per_day)
+        save_user_data(user_data)
+    else:
+        # Не хватает — ставим ВСЕ активные парсеры на паузу
+        paused_any = False
+        for p in data.get('parsers', []):
+            if p.get('status') == 'active':
+                pause_parser(user_id, p)
+                paused_any = True
+        save_user_data(user_data)
+        if paused_any:
+            await bot.send_message(
+                user_id,
+                "⏸ Недостаточно средств. Все парсеры поставлены на паузу. Пополните баланс командой /topup."
+            )
+
+async def daily_billing_loop():
+    # Списываем сразу при старте и затем — ежедневно в 03:00 UTC (пример)
+    while True:
+        # 1) Списание
+        for uid in list(user_data.keys()):
+            try:
+                await bill_user_daily(int(uid))
+            except Exception:
+                logging.exception("Billing error for %s", uid)
+        # 2) Ждём до следующего дня 03:00 UTC
+        now = datetime.utcnow()
+        tomorrow = (now + timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
+        sleep_seconds = (tomorrow - now).total_seconds()
+        await asyncio.sleep(max(60, sleep_seconds))
+
 
 
 def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
@@ -809,6 +1025,17 @@ async def cb_menu_profile(call: types.CallbackQuery):
         ref_total=data.get('ref_total', 0),
         ref_balance=data.get('ref_balance', 0),
     )
+    balance = _round2(float(data.get('balance', 0)))
+    per_day = total_daily_cost(call.from_user.id)
+    block_dt, left_days = predict_block_date(call.from_user.id)
+    extra = (
+        f"\n\n"
+        f"Дата блокировки: {block_dt} ({left_days} дн.)\n"
+        f"Баланс: {balance:.2f} ₽\n"
+        f"Общая стоимость: {per_day:.2f} ₽/день"
+    )
+    text = text + extra
+
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton(
@@ -820,10 +1047,19 @@ async def cb_menu_profile(call: types.CallbackQuery):
         types.InlineKeyboardButton(
             "⛔️ Удалить карту", callback_data="profile_delete_card"
         ),
+        types.InlineKeyboardButton("💰 Пополнить баланс", callback_data="profile_topup"),
         types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"),
     )
     await call.message.answer(text, reply_markup=kb)
     await call.answer()
+    
+
+@dp.callback_query_handler(lambda c: c.data == 'profile_topup')
+async def cb_profile_topup(call: types.CallbackQuery):
+    await call.message.answer("Введите сумму пополнения (минимум 300 ₽):")
+    await TopUpStates.waiting_amount.set()
+    await call.answer()
+
 
 
 @dp.callback_query_handler(lambda c: c.data == 'profile_paybalance')
@@ -1206,6 +1442,8 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         'api_id': '',
         'api_hash': '',
         'results': [],
+        'status': 'paused',
+        'daily_price': 0.0,
     }
     parsers.append(parser)
     info = user_clients.setdefault(user_id, info or {})
@@ -1520,6 +1758,11 @@ async def get_parser_api_hash(message: types.Message, state: FSMContext):
         user_data[str(user_id)].setdefault('parsers', []).append(parser)
         save_user_data(user_data)
 
+    parser['daily_price'] = calc_parser_daily_cost(parser)
+    parser['status'] = 'active'  # если хотите сразу стартовать
+    save_user_data(user_data)
+
+
     await start_monitor(user_id, parser)
 
     await message.answer("✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
@@ -1557,6 +1800,7 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
     stop_monitor(user_id, parser)
     parser['chats'] = chat_ids
     save_user_data(user_data)
+    parser['daily_price'] = calc_parser_daily_cost(parser)
     await start_monitor(user_id, parser)
     await state.finish()
     await message.answer("✅ Чаты обновлены.")
@@ -1576,6 +1820,7 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
     parser['keywords'] = keywords
     save_user_data(user_data)
     await start_monitor(user_id, parser)
+    parser['daily_price'] = calc_parser_daily_cost(parser)
     await state.finish()
     await message.answer("✅ Ключевые слова обновлены.")
 
@@ -1591,6 +1836,8 @@ async def edit_exclude_handler(message: types.Message, state: FSMContext):
     parser['exclude_keywords'] = words
     save_user_data(user_data)
     await start_monitor(user_id, parser)
+    parser['daily_price'] = calc_parser_daily_cost(parser)
+
     await state.finish()
     await message.answer("✅ Исключающие слова обновлены.")
 
@@ -1637,4 +1884,9 @@ async def edit_account_api_hash(message: types.Message, state: FSMContext):
 
 if __name__ == '__main__':
     print("Bot is starting...")
-    executor.start_polling(dp, skip_updates=True)
+    
+    async def on_startup(dispatcher):
+        asyncio.create_task(daily_billing_loop())
+    
+    
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
