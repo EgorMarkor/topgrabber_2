@@ -28,7 +28,7 @@ import uuid
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = "7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE"
+API_TOKEN = "6736833089:AAGhH-jqeNuev9kB-MZzlkB7q2wMi5E-Q2Q"
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -42,12 +42,14 @@ dp2 = Dispatcher(bot2, storage=storage2)
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
 # ===== New billing constants =====
-PRO_MONTHLY_RUB = 1490.00          # Базовый PRO «за парсер» до 5 чатов
-EXTRA_CHAT_MONTHLY_RUB = 490.00    # За каждый чат сверх 5
+PRO_MONTHLY_RUB = 1490.00  # Базовый PRO «за парсер» до 5 чатов
+EXTRA_CHAT_MONTHLY_RUB = 490.00  # За каждый чат сверх 5
 DAYS_IN_MONTH = 30
+
 
 def _round2(x: float) -> float:
     return float(f"{x:.2f}")
+
 
 def calc_parser_daily_cost(parser: dict) -> float:
     """Стоимость парсера в сутки исходя из числа чатов."""
@@ -55,6 +57,7 @@ def calc_parser_daily_cost(parser: dict) -> float:
     base = PRO_MONTHLY_RUB / DAYS_IN_MONTH
     extras = max(0, chats - 5) * (EXTRA_CHAT_MONTHLY_RUB / DAYS_IN_MONTH)
     return _round2(base + extras)
+
 
 def total_daily_cost(user_id: int) -> float:
     """Сумма в сутки по всем активным парсерам пользователя."""
@@ -64,6 +67,7 @@ def total_daily_cost(user_id: int) -> float:
         if p.get('status', 'paused') == 'active':
             total += p.get('daily_price') or calc_parser_daily_cost(p)
     return _round2(total)
+
 
 def predict_block_date(user_id: int) -> tuple[str, int]:
     """
@@ -78,6 +82,7 @@ def predict_block_date(user_id: int) -> tuple[str, int]:
     days = int(bal // per_day)
     dt = (datetime.utcnow() + timedelta(days=days)).strftime('%d.%m.%Y')
     return dt, days
+
 
 RETURN_URL = "https://t.me/TOPGrabber_bot"
 if YOOKASSA_SHOP_ID and YOOKASSA_TOKEN:
@@ -103,12 +108,14 @@ CHAT_LIMIT = 5
 morph = MorphAnalyzer()
 stemmer_en = snowballstemmer.stemmer("english")
 
+
 def normalize_word(word: str) -> str:
     """Return normalized form for keyword matching."""
     word = word.lower()
     if re.search("[а-яА-Я]", word):
         return morph.parse(word)[0].normal_form
     return stemmer_en.stemWord(word)
+
 
 def t(key, **kwargs):
     text = TEXTS.get(key, key)
@@ -118,6 +125,7 @@ def t(key, **kwargs):
         except Exception:
             pass
     return text
+
 
 def load_user_data():
     if os.path.exists(DATA_FILE):
@@ -132,16 +140,16 @@ def load_user_data():
                 u.setdefault('inactive_notified', False)
                 u.setdefault('used_promos', [])
                 u.setdefault('chat_limit', CHAT_LIMIT)
-                u.setdefault('balance', 0.0)                 # новый кошелёк пользователя
-                u.setdefault('billing_enabled', True)        # флаг на будущее
+                u.setdefault('balance', 0.0)  # новый кошелёк пользователя
+                u.setdefault('billing_enabled', True)  # флаг на будущее
                 # Старые поля подписки можно оставить — они не будут использоваться
                 for p in u.get('parsers', []):
                     p.setdefault('results', [])
                     p.setdefault('name', 'Без названия')
                     p.setdefault('api_id', '')
                     p.setdefault('api_hash', '')
-                    p.setdefault('status', 'paused')             # 'active' | 'paused'
-                    p.setdefault('daily_price', 0.0)             # кэш рассчётной цены/сутки
+                    p.setdefault('status', 'paused')  # 'active' | 'paused'
+                    p.setdefault('daily_price', 0.0)  # кэш рассчётной цены/сутки
                     # Актуализируем daily_price, если уже известны чаты
                     if not p.get('daily_price'):
                         p['daily_price'] = calc_parser_daily_cost(p)
@@ -196,6 +204,7 @@ def create_topup_payment(user_id: int, amount_rub: float):
     amount = f"{amount_rub:.2f}"
     return create_payment(user_id, amount, f"Пополнение баланса {user_id} на {amount} ₽")
 
+
 async def wait_topup_and_credit(user_id: int, payment_id: str, amount: float):
     for _ in range(60):
         status = check_payment(payment_id)
@@ -214,7 +223,6 @@ async def wait_topup_and_credit(user_id: int, payment_id: str, amount: float):
             return
         await asyncio.sleep(5)
     await bot.send_message(user_id, t('payment_failed', status='timeout'))
-
 
 
 def create_pro_payment(user_id: int):
@@ -251,6 +259,7 @@ async def wait_payment_and_activate(user_id: int, payment_id: str, chats: int):
             return
         await asyncio.sleep(5)
     await bot.send_message(user_id, t('payment_failed', status='timeout'))
+
 
 def check_subscription(user_id: int):
     data = get_user_data_entry(user_id)
@@ -362,6 +371,7 @@ async def start_monitor(user_id: int, parser: dict):
     if 'task' not in info:
         info['task'] = asyncio.create_task(client.run_until_disconnected())
 
+
 def stop_monitor(user_id: int, parser: dict):
     info = user_clients.get(user_id)
     if not info:
@@ -376,11 +386,13 @@ def stop_monitor(user_id: int, parser: dict):
     parser.pop('handler', None)
     parser.pop('event', None)
 
+
 def pause_parser(user_id: int, parser: dict):
     """Ставит парсер на паузу и снимает обработчики."""
     parser['status'] = 'paused'
     stop_monitor(user_id, parser)
     save_user_data(user_data)
+
 
 async def resume_parser(user_id: int, parser: dict):
     """Возобновляет парсер и пересчитывает цену."""
@@ -517,7 +529,7 @@ def parser_settings_keyboard(idx: int) -> types.InlineKeyboardMarkup:
 
 class TopUpStates(StatesGroup):
     waiting_amount = State()
-    
+
 
 @dp.callback_query_handler(lambda c: c.data.startswith('parser_pause_'))
 async def cb_parser_pause(call: types.CallbackQuery):
@@ -534,6 +546,7 @@ async def cb_parser_pause(call: types.CallbackQuery):
     pause_parser(user_id, p)
     await call.message.answer("⏸ Парсер поставлен на паузу.")
 
+
 @dp.callback_query_handler(lambda c: c.data.startswith('parser_resume_'))
 async def cb_parser_resume(call: types.CallbackQuery):
     idx = int(call.data.split('_')[2]) - 1
@@ -547,6 +560,7 @@ async def cb_parser_resume(call: types.CallbackQuery):
     # Допускаем резюмирование даже без денег — спишется ночью; можно ужесточить при желании
     await resume_parser(user_id, data['parsers'][idx])
     await call.message.answer("▶️ Парсер запущен.")
+
 
 @dp.callback_query_handler(lambda c: c.data.startswith('parser_delete_'))
 async def cb_parser_delete(call: types.CallbackQuery):
@@ -569,11 +583,11 @@ async def cb_parser_delete(call: types.CallbackQuery):
     await call.answer()
 
 
-
 @dp.message_handler(commands=['topup'])
 async def cmd_topup(message: types.Message, state: FSMContext):
     await message.answer("Введите сумму пополнения (минимум 300 ₽):")
     await TopUpStates.waiting_amount.set()
+
 
 @dp.message_handler(state=TopUpStates.waiting_amount)
 async def topup_amount(message: types.Message, state: FSMContext):
@@ -626,6 +640,7 @@ async def bill_user_daily(user_id: int):
                 "⏸ Недостаточно средств. Все парсеры поставлены на паузу. Пополните баланс командой /topup."
             )
 
+
 async def daily_billing_loop():
     # Списываем сразу при старте и затем — ежедневно в 03:00 UTC (пример)
     while True:
@@ -640,7 +655,6 @@ async def daily_billing_loop():
         tomorrow = (now + timedelta(days=1)).replace(hour=3, minute=0, second=0, microsecond=0)
         sleep_seconds = (tomorrow - now).total_seconds()
         await asyncio.sleep(max(60, sleep_seconds))
-
 
 
 def parser_info_text(user_id: int, parser: dict, created: bool = False) -> str:
@@ -738,7 +752,7 @@ async def cmd_delete_parser(message: types.Message):
         return
     kb = types.InlineKeyboardMarkup(row_width=1)
     for idx, p in parsers:
-        name = p.get('name', f'Парсер {idx+1}')
+        name = p.get('name', f'Парсер {idx + 1}')
         kb.add(types.InlineKeyboardButton(name, callback_data=f'delp_select_{idx}'))
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
     await message.answer("Выберите парсер для удаления:", reply_markup=kb)
@@ -824,7 +838,7 @@ async def cb_setup_pay(call: types.CallbackQuery, state: FSMContext):
     kb = types.InlineKeyboardMarkup(row_width=1)
     for idx, p in enumerate(data.get('parsers'), 1):
         name = p.get('name', f'Парсер {idx}')
-        kb.add(types.InlineKeyboardButton(name, callback_data=f'pay_select_{idx-1}'))
+        kb.add(types.InlineKeyboardButton(name, callback_data=f'pay_select_{idx - 1}'))
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="menu_setup"))
     await call.message.answer("Выберите парсер:", reply_markup=kb)
     await call.answer()
@@ -865,9 +879,12 @@ async def cb_pay_expand(call: types.CallbackQuery, state: FSMContext):
 @dp.callback_query_handler(lambda c: c.data.startswith('pay_infinity_'))
 async def cb_pay_infinity(call: types.CallbackQuery):
     """Inform about INFINITY plan."""
+    keyboard111 = types.InlineKeyboardMarkup()
+    keyboard111.add(types.InlineKeyboardButton(text="Подключить", url="https://t.me/antufev2025"))
     await call.message.answer(
         "Тариф INFINITY — 149 990 ₽/мес. Неограниченные чаты и слова, персональный аккаунт-менеджер.\n"
-        "Для подключения напишите @TopGrabberSupport"
+        "Для подключения напишите @TopGrabberSupport",
+        reply_markup=keyboard111
     )
     await call.answer()
 
@@ -1052,14 +1069,13 @@ async def cb_menu_profile(call: types.CallbackQuery):
     )
     await call.message.answer(text, reply_markup=kb)
     await call.answer()
-    
+
 
 @dp.callback_query_handler(lambda c: c.data == 'profile_topup')
 async def cb_profile_topup(call: types.CallbackQuery):
     await call.message.answer("Введите сумму пополнения (минимум 300 ₽):")
     await TopUpStates.waiting_amount.set()
     await call.answer()
-
 
 
 @dp.callback_query_handler(lambda c: c.data == 'profile_paybalance')
@@ -1107,24 +1123,55 @@ async def cmd_tariff_pro(message: types.Message, state: FSMContext):
     await _process_tariff_pro(message, state)
 
 
+
 @dp.message_handler(state=PromoStates.waiting_promo)
 async def promo_entered(message: types.Message, state: FSMContext):
-    code = message.text.strip().upper()
+    text_raw = (message.text or "").strip()
+    code = text_raw.upper()
     user_id = message.from_user.id
+
+    # 1) Пропуск ввода промокода
+    if text_raw.lower() in {"пропустить", "skip", "/skip"}:
+        await message.answer("Ок, пропускаем ввод промокода.", reply_markup=types.ReplyKeyboardRemove())
+        data = get_user_data_entry(user_id)
+        used_promos = data.setdefault('used_promos', [])
+        await message.answer(
+            "Перейдите по ссылке для оплаты тарифа PRO.",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+        payment_id, url = create_pro_payment(user_id)
+        if not payment_id:
+            await message.answer("Не удалось создать платёж. Попробуйте позже.")
+        else:
+            data['payment_id'] = payment_id
+            save_user_data(user_data)
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
+            await message.answer("Нажмите кнопку для оплаты.", reply_markup=kb)
+            asyncio.create_task(
+                wait_payment_and_activate(user_id, payment_id, data.get('chat_limit', CHAT_LIMIT))
+            )
+        await state.finish()
+        return
+
     data = get_user_data_entry(user_id)
     used_promos = data.setdefault('used_promos', [])
+
+    # 2) Проверка уже использованных промокодов
     if code in used_promos:
         await message.answer(
             t('promo_already_used'),
             reply_markup=types.ReplyKeyboardRemove(),
         )
-        await state.finish()
-        return
+        await message.answer('Введите промокод или нажмите "Пропустить".')
+        return  # остаёмся в том же стейте
+
+    # 3) Обработка демо-промокода
     if code == 'DEMO':
-        expiry = int((datetime.utcnow() + timedelta(days=7)).timestamp())
+        expiry = int((datetime.now(UTC) + timedelta(days=7)).timestamp())
         data['subscription_expiry'] = expiry
         used_promos.append(code)
-        save_user_data(user_data)
+        save_user_data(data)  # фикс: сохраняем именно data
         await message.answer(
             "Промокод принят! Вам предоставлено 7 дней бесплатного тарифа PRO.",
             reply_markup=types.ReplyKeyboardRemove(),
@@ -1133,6 +1180,17 @@ async def promo_entered(message: types.Message, state: FSMContext):
         await message.answer("Используйте /login для авторизации.")
         return
 
+    # 4) Если промокод неизвестный (добавляйте платные коды в known_codes)
+    known_codes = {'DEMO'}
+    if code not in known_codes:
+        await message.answer(
+            "Неверный промокод.",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+        await message.answer('Введите промокод или нажмите "Пропустить".')
+        return  # остаёмся в том же стейте
+
+    # 5) Ветка для платных промокодов (пример; сейчас недостижима при known_codes == {'DEMO'})
     await message.answer(
         "Перейдите по ссылке для оплаты тарифа PRO.",
         reply_markup=types.ReplyKeyboardRemove(),
@@ -1142,7 +1200,7 @@ async def promo_entered(message: types.Message, state: FSMContext):
         await message.answer("Не удалось создать платёж. Попробуйте позже.")
     else:
         data['payment_id'] = payment_id
-        save_user_data(user_data)
+        save_user_data(data)
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
         await message.answer("Нажмите кнопку для оплаты.", reply_markup=kb)
@@ -1150,6 +1208,7 @@ async def promo_entered(message: types.Message, state: FSMContext):
             wait_payment_and_activate(user_id, payment_id, data.get('chat_limit', CHAT_LIMIT))
         )
     await state.finish()
+
 
 
 @dp.callback_query_handler(lambda c: c.data == 'result')
@@ -1217,7 +1276,7 @@ async def cb_send_csv(call: types.CallbackQuery):
         await call.message.answer("Нет сохранённых результатов для этого парсера.")
         await call.answer()
         return
-    path = f"results_{user_id}_{idx+1}.csv"
+    path = f"results_{user_id}_{idx + 1}.csv"
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
@@ -1260,6 +1319,7 @@ async def cmd_check_payment(message: types.Message):
     else:
         await message.answer(t('payment_failed', status=status))
 
+
 async def send_all_results(user_id: int):
     data = user_data.get(str(user_id))
     if not data:
@@ -1300,7 +1360,7 @@ async def send_parser_results(user_id: int, idx: int):
     if not results:
         await bot.send_message(user_id, t('no_results'))
         return
-    path = f"results_{user_id}_{idx+1}.csv"
+    path = f"results_{user_id}_{idx + 1}.csv"
     with open(path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["keyword", "chat", "sender", "datetime", "link", "text"])
@@ -1400,6 +1460,7 @@ async def get_parser_name(message: types.Message, state: FSMContext):
     )
     await ParserStates.waiting_chats.set()
 
+
 @dp.message_handler(commands=['addparser'], state='*')
 async def cmd_add_parser(message: types.Message, state: FSMContext):
     await state.finish()
@@ -1456,6 +1517,7 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
         reply_markup=parser_settings_keyboard(parser_id),
     )
 
+
 @dp.message_handler(commands=['login'], state="*")
 async def start_login(message: types.Message, state: FSMContext):
     await state.finish()
@@ -1494,13 +1556,15 @@ async def start_login(message: types.Message, state: FSMContext):
                 if user_clients[user_id]['parsers']:
                     await message.answer("✅ Найдены сохранённые парсеры. Мониторинг запущен.")
                     return
-        await message.answer("👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:", parse_mode="Markdown")
+        await message.answer("👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:",
+                             parse_mode="Markdown")
     else:
         await message.answer(
             "👋 Привет! Для начала работы введите свой *api_id* Telegram:",
             parse_mode="Markdown"
         )
     await AuthStates.waiting_api_id.set()
+
 
 @dp.message_handler(state=AuthStates.waiting_api_id)
 async def get_api_id(message: types.Message, state: FSMContext):
@@ -1511,6 +1575,7 @@ async def get_api_id(message: types.Message, state: FSMContext):
     await state.update_data(api_id=int(text))
     await message.answer("Отлично. Введите *api_hash* вашего приложения:", parse_mode="Markdown")
     await AuthStates.waiting_api_hash.set()
+
 
 @dp.message_handler(state=AuthStates.waiting_api_hash)
 async def get_api_hash(message: types.Message, state: FSMContext):
@@ -1524,44 +1589,89 @@ async def get_api_hash(message: types.Message, state: FSMContext):
     )
     await AuthStates.waiting_phone.set()
 
+
+
+RETRY_ATTEMPTS = 3          # сколько раз пробуем снова запросить код
+RETRY_BASE_DELAY = 2        # экспоненциальная пауза между попытками: 2, 4, 8...
+
 @dp.message_handler(state=AuthStates.waiting_phone)
 async def get_phone(message: types.Message, state: FSMContext):
-    phone = message.text.strip()
+    phone = (message.text or "").strip()
     data = await state.get_data()
     api_id = data.get('api_id')
     api_hash = data.get('api_hash')
     user_id = message.from_user.id
     session_name = f"session_{user_id}"
 
-    try:
-        client = TelegramClient(session_name, api_id, api_hash)
-        await client.connect()
-        result = await client.send_code_request(phone)
-        phone_hash = result.phone_code_hash
-    except PhoneNumberInvalidError:
-        await message.answer("❌ Неверный номер телефона. Введите заново:")
-        return
-    except FloodWaitError as e:
-        await message.answer(f"⚠️ Telegram просит подождать {e.seconds} секунд перед следующей попыткой.")
-        await state.finish()
-        return
-    except Exception as e:
-        logging.exception(e)
-        await message.answer(f"⚠️ Ошибка при запросе кода: {e}. Попробуйте /start.")
-        await state.finish()
+    # легкая валидация номера (чтобы не дергать Telegram на явном мусоре)
+    normalized = phone.replace(" ", "").replace("-", "")
+    if not normalized.startswith("+"):
+        normalized = "+" + normalized
+    if not normalized[1:].isdigit():
+        await message.answer("❌ Похоже, номер указан неверно. Укажите номер в формате +1234567890")
         return
 
+    client = TelegramClient(session_name, api_id, api_hash)
+    try:
+        await client.connect()
+    except Exception as e:
+        logging.exception(e)
+        await message.answer(f"⚠️ Не удалось подключиться к Telegram: {e}")
+        # не просим номер — просто сообщаем и выходим; пользователь может повторить отправку того же номера
+        return
+
+    phone_hash = None
+    last_error = None
+
+    # первая попытка + повторы: всегда пытаемся запросить КОД, а не номер
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            result = await client.send_code_request(normalized)
+            phone_hash = result.phone_code_hash
+            break
+        except PhoneNumberInvalidError:
+            await message.answer("❌ Неверный номер телефона. Введите номер заново (например, +1234567890).")
+            await client.disconnect()
+            return
+        except FloodWaitError as e:
+            last_error = e
+            await message.answer(f"⏳ Telegram просит подождать {e.seconds} сек. Запрашиваю код повторно автоматически...")
+            await asyncio.sleep(e.seconds)
+            continue
+        except Exception as e:
+            last_error = e
+            delay = RETRY_BASE_DELAY ** attempt
+            await message.answer(
+                f"⚠️ Ошибка при запросе кода (попытка {attempt}/{RETRY_ATTEMPTS}): {e}\n"
+                f"Пробую ещё раз через {delay} сек..."
+            )
+            await asyncio.sleep(delay)
+            continue
+
+    # не получили phone_hash — честно сообщаем и выходим (номер не запрашиваем)
+    if not phone_hash:
+        await client.disconnect()
+        detail = ""
+        if isinstance(last_error, FloodWaitError):
+            detail = f" Подождите {last_error.seconds} сек и попробуйте ещё раз."
+        elif last_error:
+            detail = f" Детали: {last_error}"
+        await message.answer("🚧 Не удалось запросить код подтверждения у Telegram." + detail)
+        return
+
+    # успех: сохраняем клиента и hash, переводим на ввод кода
     user_clients[user_id] = {
         'client': client,
-        'phone': phone,
+        'phone': normalized,
         'phone_hash': phone_hash,
         'parsers': []
     }
+
     saved = user_data.get(str(user_id), {})
     saved.update({
         'api_id': api_id,
         'api_hash': api_hash,
-        'phone': phone,
+        'phone': normalized,
     })
     saved.setdefault('parsers', [])
     saved.setdefault('subscription_expiry', 0)
@@ -1572,14 +1682,17 @@ async def get_phone(message: types.Message, state: FSMContext):
     saved.setdefault('chat_limit', CHAT_LIMIT)
     user_data[str(user_id)] = saved
     save_user_data(user_data)
-    await state.update_data(phone=phone)
+
+    # кладем в FSM ещё и phone_hash — пригодится в состоянии waiting_code
+    await state.update_data(phone=normalized, phone_hash=phone_hash)
 
     await message.answer(
-        "📱 Код отправлен! Пожалуйста, введите код, *вставляя любые символы* (например, пробелы или дефисы) между цифрами."
-        " Я автоматически уберу лишние символы.",
+        "📱 Код отправлен! Введите код подтверждения (можно с пробелами или дефисами — я их удалю).",
         parse_mode="Markdown"
     )
     await AuthStates.waiting_code.set()
+
+
 
 @dp.message_handler(state=AuthStates.waiting_code)
 async def get_code(message: types.Message, state: FSMContext):
@@ -1625,6 +1738,7 @@ async def get_code(message: types.Message, state: FSMContext):
     )
     await ParserStates.waiting_chats.set()
 
+
 @dp.message_handler(state=AuthStates.waiting_password)
 async def get_password(message: types.Message, state: FSMContext):
     password = message.text.strip()
@@ -1649,6 +1763,7 @@ async def get_password(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
     await ParserStates.waiting_chats.set()
+
 
 async def _process_chats(message: types.Message, state: FSMContext, next_state):
     text = message.text.strip().replace(',', ' ')
@@ -1692,6 +1807,7 @@ async def get_chats_auth(message: types.Message, state: FSMContext):
 @dp.message_handler(state=ParserStates.waiting_chats)
 async def get_chats_parser(message: types.Message, state: FSMContext):
     await _process_chats(message, state, ParserStates.waiting_keywords)
+
 
 async def _process_keywords(message: types.Message, state: FSMContext):
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
@@ -1761,7 +1877,6 @@ async def get_parser_api_hash(message: types.Message, state: FSMContext):
     parser['daily_price'] = calc_parser_daily_cost(parser)
     parser['status'] = 'active'  # если хотите сразу стартовать
     save_user_data(user_data)
-
 
     await start_monitor(user_id, parser)
 
@@ -1882,11 +1997,13 @@ async def edit_account_api_hash(message: types.Message, state: FSMContext):
     await state.finish()
     await message.answer("✅ Аккаунт обновлён.")
 
+
 if __name__ == '__main__':
     print("Bot is starting...")
-    
+
+
     async def on_startup(dispatcher):
         asyncio.create_task(daily_billing_loop())
-    
-    
+
+
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
