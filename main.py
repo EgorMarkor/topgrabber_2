@@ -18,106 +18,146 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
-    FloodWaitError
+    FloodWaitError,
 )
 from yookassa import Payment, Configuration
 from pymorphy3 import MorphAnalyzer
 import snowballstemmer
 import uuid
-from aiogram.utils.exceptions import MessageNotModified, MessageToEditNotFound, Unauthorized
+from aiogram.utils.exceptions import (
+    MessageNotModified,
+    MessageToEditNotFound,
+    Unauthorized,
+    CantInitiateConversation,
+    ChatNotFound,
+    BotBlocked,
+    Forbidden,
+)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = "7930844421:AAFKC9cUVVdttJHa3fpnUSnAWgr8Wa6-wPE"
+API_TOKEN = os.getenv("API_TOKEN")
+if not API_TOKEN:
+    logging.error("API_TOKEN is not set in environment")
+    raise RuntimeError("API_TOKEN missing")
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-API_TOKEN2 = "8496643232:AAHuSYuFH8DyvDe8sCNnhpYxenhX6Abs298"
-bot2 = Bot(token=API_TOKEN2)
+API_TOKEN2 = os.getenv("API_TOKEN2")
+if API_TOKEN2:
+    bot2 = Bot(token=API_TOKEN2)
+else:
+    bot2 = None
+    logging.warning("API_TOKEN2 is not set; notifications bot disabled")
 
 # ЮKassa configuration
-YOOKASSA_SHOP_ID = 443246
-YOOKASSA_TOKEN = "live_gHchHaktHqu6Lz_FdaOuwZJ9A_ONwT7UUVzdRDZ9igo"
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_TOKEN = os.getenv("YOOKASSA_TOKEN")
+if YOOKASSA_SHOP_ID and YOOKASSA_TOKEN:
+    Configuration.account_id = YOOKASSA_SHOP_ID
+    Configuration.secret_key = YOOKASSA_TOKEN
+else:
+    logging.warning("YOOKASSA credentials are missing; payment features may not work")
 # ===== New billing constants =====
 PRO_MONTHLY_RUB = 1490.00  # Базовый PRO «за парсер» до 5 чатов
 EXTRA_CHAT_MONTHLY_RUB = 490.00  # За каждый чат сверх 5
 DAYS_IN_MONTH = 30
 
 
-async def safe_send_message(bot, user_id: int, text: str, reply_markup=None, parse_mode=None) -> bool:
-    """
-    Safely send a message to a user, handling Unauthorized errors and bot recipients.
-    Returns True if the message was sent successfully, False otherwise.
+async def safe_send_message(
+    bot: Bot,
+    user_id: int,
+    text: str,
+    reply_markup=None,
+    parse_mode=None,
+) -> types.Message | None:
+    """Safely send a message to a user.
+
+    Checks that recipient is not a bot and suppresses common delivery
+    exceptions. Returns the sent ``Message`` or ``None`` if sending was
+    skipped or failed.
     """
     try:
-        # Check if the recipient is a bot or invalid
         chat = await bot.get_chat(user_id)
-        if getattr(chat, 'type', None) == 'bot':
-            logging.warning(f"Attempted to send message to a bot (user_id: {user_id})")
-            return False
-        # Send the message
-        await bot.send_message(
-            chat_id=user_id,
-            text=text,
+        is_recipient_bot = getattr(chat, "is_bot", False)
+        if is_recipient_bot:
+            logging.warning(f"Skip send: recipient is a bot (user_id={user_id})")
+            return None
+
+        return await bot.send_message(
+            user_id,
+            text,
             reply_markup=reply_markup,
-            parse_mode=parse_mode
+            parse_mode=parse_mode,
         )
-        return True
-    except Unauthorized as e:
-        logging.error(f"Unauthorized error when sending message to {user_id}: {e}")
-        return False
+    except (
+        Unauthorized,
+        CantInitiateConversation,
+        ChatNotFound,
+        BotBlocked,
+        Forbidden,
+    ) as e:
+        logging.error(f"Cannot send to {user_id}: {e}")
+        return None
     except Exception as e:
-        logging.error(f"Error sending message to {user_id}: {e}")
-        return False
+        logging.error(f"Unexpected send error to {user_id}: {e}")
+        return None
 
 
 def get_or_create_user_entry(user_id: int):
     return get_user_data_entry(user_id)
 
 
-async def ui_update(user_id: int, text: str, reply_markup: types.InlineKeyboardMarkup | None = None, parse_mode: str | None = None):
+async def ui_send_new(
+    user_id: int,
+    text: str,
+    reply_markup: types.InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> types.Message | None:
+    """Send a new UI message and remember its id."""
     data = get_or_create_user_entry(user_id)
-    msg_id = data.get('ui_msg_id')
     try:
-        if msg_id:
-            try:
-                await bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=msg_id,
-                    text=text,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode
-                )
-            except (MessageNotModified, MessageToEditNotFound):
-                # If editing fails, send a new message
-                if await safe_send_message(bot, user_id, text, reply_markup, parse_mode):
-                    m = await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-                    data['ui_msg_id'] = m.message_id
-                    save_user_data(user_data)
-        else:
-            if await safe_send_message(bot, user_id, text, reply_markup, parse_mode):
-                m = await bot.send_message(user_id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-                data['ui_msg_id'] = m.message_id
-                save_user_data(user_data)
+        m = await safe_send_message(
+            bot,
+            user_id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+        if m:
+            data["ui_msg_id"] = m.message_id
+            save_user_data(user_data)
+        return m
     except Exception as e:
-        logging.error(f"Error in ui_Update for user {user_id}: {e}")
+        logging.error(f"Error in ui_send_new for user {user_id}: {e}")
+        return None
         
         
-async def ui_from_callback_edit(call: types.CallbackQuery, text: str, reply_markup: types.InlineKeyboardMarkup | None = None, parse_mode: str | None = None):
-    """Для inline-кнопок — редактируем исходное сообщение, а также синхронизируем ui_msg_id."""
+async def ui_from_callback_edit(
+    call: types.CallbackQuery,
+    text: str,
+    reply_markup: types.InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> types.Message | None:
+    """Edit message triggered from callback or send a new one on failure."""
     data = get_or_create_user_entry(call.from_user.id)
     try:
-        await call.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        data['ui_msg_id'] = call.message.message_id
-        save_user_data(user_data)
+        m = await call.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except (MessageNotModified, MessageToEditNotFound):
-        if await safe_send_message(bot, call.from_user.id, text, reply_markup, parse_mode):
-            m = await bot.send_message(call.from_user.id, text, reply_markup=reply_markup, parse_mode=parse_mode)
-            data['ui_msg_id'] = m.message_id
-            save_user_data(user_data)
-    await call.answer()        
+        m = await safe_send_message(
+            bot,
+            call.from_user.id,
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    if m:
+        data["ui_msg_id"] = m.message_id
+        save_user_data(user_data)
+    await call.answer()
+    return m
 
 
 def _round2(x: float) -> float:
@@ -456,7 +496,7 @@ async def start_monitor(user_id: int, parser: dict):
                     f"Link: {html.escape(link)}\n"
                     f"<pre>{preview}</pre>"
                 )
-                if not await safe_send_message(bot2, user_id, message_text, parse_mode="HTML"):
+                if not bot2 or await safe_send_message(bot2, user_id, message_text, parse_mode="HTML") is None:
                     await safe_send_message(
                         bot,
                         user_id,
@@ -549,7 +589,7 @@ class ExpandProStates(StatesGroup):
 @dp.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     """Отправить справочную информацию."""
-    await ui_update(message.from_user.id, HELP_TEXT)
+    await ui_send_new(message.from_user.id, HELP_TEXT)
 
 
 @dp.message_handler(commands=['enable_recurring'])
@@ -557,7 +597,7 @@ async def enable_recurring(message: types.Message):
     data = get_user_data_entry(message.from_user.id)
     data['recurring'] = True
     save_user_data(user_data)
-    await ui_update(message.from_user.id, t('recurring_enabled'))
+    await ui_send_new(message.from_user.id, t('recurring_enabled'))
 
 
 @dp.message_handler(commands=['disable_recurring'])
@@ -565,18 +605,18 @@ async def disable_recurring(message: types.Message):
     data = get_user_data_entry(message.from_user.id)
     data['recurring'] = False
     save_user_data(user_data)
-    await ui_update(message.from_user.id, t('recurring_disabled'))
+    await ui_send_new(message.from_user.id, t('recurring_disabled'))
 
 
 @dp.message_handler(commands=['info'])
 async def cmd_info(message: types.Message):
     data = user_data.get(str(message.from_user.id))
     if not data:
-        await ui_update(message.from_user.id, "Нет сохранённых данных.")
+        await ui_send_new(message.from_user.id, "Нет сохранённых данных.")
         return
     parsers = data.get('parsers') or []
     if not parsers:
-        await ui_update(message.from_user.id, "Парсеры не настроены.")
+        await ui_send_new(message.from_user.id, "Парсеры не настроены.")
         return
     lines = []
     for idx, p in enumerate(parsers, 1):
@@ -587,7 +627,7 @@ async def cmd_info(message: types.Message):
         lines.append(
             f"#{idx} {name}\nAPI ID: {api_id}\nЧаты: {chats}\nКлючевые слова: {', '.join(kws)}"
         )
-    await ui_update(message.from_user.id, "\n\n".join(lines))
+    await ui_send_new(message.from_user.id, "\n\n".join(lines))
 
 
 def main_menu_keyboard() -> types.InlineKeyboardMarkup:
@@ -692,7 +732,7 @@ async def cb_parser_delete(call: types.CallbackQuery):
 
 @dp.message_handler(commands=['topup'])
 async def cmd_topup(message: types.Message, state: FSMContext):
-    await ui_update(message.from_user.id, "Введите сумму пополнения (минимум 300 ₽):")
+    await ui_send_new(message.from_user.id, "Введите сумму пополнения (минимум 300 ₽):")
     await TopUpStates.waiting_amount.set()
 
 
@@ -702,22 +742,22 @@ async def topup_amount(message: types.Message, state: FSMContext):
     try:
         amount = float(text)
     except ValueError:
-        await ui_update(message.from_user.id, "Введите число, например 500 или 1200.50")
+        await ui_send_new(message.from_user.id, "Введите число, например 500 или 1200.50")
         return
     if amount < 300:
-        await ui_update(message.from_user.id, "Минимальная сумма пополнения — 300 ₽. Введите другую сумму:")
+        await ui_send_new(message.from_user.id, "Минимальная сумма пополнения — 300 ₽. Введите другую сумму:")
         return
     user_id = message.from_user.id
     payment_id, url = create_topup_payment(user_id, amount)
     if not payment_id:
-        await ui_update(message.from_user.id, "Не удалось создать платёж. Попробуйте позже.")
+        await ui_send_new(message.from_user.id, "Не удалось создать платёж. Попробуйте позже.")
     else:
         entry = get_user_data_entry(user_id)
         entry['payment_id'] = payment_id
         save_user_data(user_data)
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
-        await ui_update(message.from_user.id, "Нажмите кнопку для оплаты.", reply_markup=kb)
+        await ui_send_new(message.from_user.id, "Нажмите кнопку для оплаты.", reply_markup=kb)
         asyncio.create_task(wait_topup_and_credit(user_id, payment_id, amount))
     await state.finish()
 
@@ -806,14 +846,14 @@ async def cmd_start(message: types.Message, state: FSMContext):
         data['started'] = True
         save_user_data(user_data)
     uid = message.from_user.id
-    await ui_update(uid, t('welcome'), reply_markup=main_menu_keyboard())
+    await ui_send_new(uid, t('welcome'), reply_markup=main_menu_keyboard())
 
 
 @dp.message_handler(commands=['menu'], state="*")
 async def cmd_menu(message: types.Message, state: FSMContext):
     await state.finish()
     uid = message.from_user.id
-    await ui_update(uid, t('menu_main'), reply_markup=main_menu_keyboard())
+    await ui_send_new(uid, t('menu_main'), reply_markup=main_menu_keyboard())
 
 
 @dp.message_handler(commands=['result'])
@@ -840,7 +880,7 @@ async def cmd_delete_card(message: types.Message):
     if data:
         data.pop('card', None)
         save_user_data(user_data)
-    await ui_update(message.from_user.id, "Данные карты удалены.")
+    await ui_send_new(message.from_user.id, "Данные карты удалены.")
 
 
 @dp.message_handler(commands=['delete_parser'])
@@ -848,7 +888,7 @@ async def cmd_delete_parser(message: types.Message):
     """Начать процесс удаления парсера."""
     data = user_data.get(str(message.from_user.id))
     if not data:
-        await ui_update(message.from_user.id, "Данные не найдены.")
+        await ui_send_new(message.from_user.id, "Данные не найдены.")
         return
     parsers = [
         (idx, p)
@@ -856,14 +896,14 @@ async def cmd_delete_parser(message: types.Message):
         if not p.get('paid')
     ]
     if not parsers:
-        await ui_update(message.from_user.id, "Нет доступных парсеров для удаления.")
+        await ui_send_new(message.from_user.id, "Нет доступных парсеров для удаления.")
         return
     kb = types.InlineKeyboardMarkup(row_width=1)
     for idx, p in parsers:
         name = p.get('name', f'Парсер {idx + 1}')
         kb.add(types.InlineKeyboardButton(name, callback_data=f'delp_select_{idx}'))
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
-    await ui_update(message.from_user.id, "Выберите парсер для удаления:", reply_markup=kb)
+    await ui_send_new(message.from_user.id, "Выберите парсер для удаления:", reply_markup=kb)
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith('delp_select_'))
@@ -1002,7 +1042,7 @@ async def expand_pro_chats(message: types.Message, state: FSMContext):
     """Handle number of chats for PRO expansion."""
     text = message.text.strip()
     if not text.isdigit() or int(text) <= 0:
-        await ui_update(message.from_user.id, "Введите количество чатов числом")
+        await ui_send_new(message.from_user.id, "Введите количество чатов числом")
         return
     chats = int(text)
     price = PRO_MONTHLY_RUB + max(0, chats - 5) * EXTRA_CHAT_MONTHLY_RUB
@@ -1013,7 +1053,7 @@ async def expand_pro_chats(message: types.Message, state: FSMContext):
         types.InlineKeyboardButton("❌ Отмена", callback_data='expand_cancel'),
         types.InlineKeyboardButton("🔙 Назад", callback_data='expand_back'),
     )
-    await ui_update(message.from_user.id,
+    await ui_send_new(message.from_user.id,
         f"Стоимость тарифа PRO на {chats} чатов составит {price} ₽/мес. Подтвердить оплату?",
         reply_markup=kb,
     )
@@ -1205,21 +1245,21 @@ async def partner_transfer_amount(message: types.Message, state: FSMContext):
     try:
         amount = float(text)
     except ValueError:
-        await ui_update(message.from_user.id, "Введите число, например 500 или 1200.50")
+        await ui_send_new(message.from_user.id, "Введите число, например 500 или 1200.50")
         return
     if amount <= 0:
-        await ui_update(message.from_user.id, "Сумма должна быть положительной.")
+        await ui_send_new(message.from_user.id, "Сумма должна быть положительной.")
         return
     user_id = message.from_user.id
     data = get_user_data_entry(user_id)
     ref_bal = float(data.get('ref_balance', 0))
     if amount > ref_bal:
-        await ui_update(message.from_user.id, f"Недостаточно на партнёрском балансе (доступно {ref_bal:.2f} ₽). Введите меньшую сумму:")
+        await ui_send_new(message.from_user.id, f"Недостаточно на партнёрском балансе (доступно {ref_bal:.2f} ₽). Введите меньшую сумму:")
         return
     data['ref_balance'] = _round2(ref_bal - amount)
     data['balance'] = _round2(float(data.get('balance', 0)) + amount)
     save_user_data(user_data)
-    await ui_update(message.from_user.id, f"✅ Переведено {amount:.2f} ₽ с партнёрского баланса на основной.")
+    await ui_send_new(message.from_user.id, f"✅ Переведено {amount:.2f} ₽ с партнёрского баланса на основной.")
     await state.finish()
 
 
@@ -1244,7 +1284,7 @@ async def _process_tariff_pro(message: types.Message, state: FSMContext):
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("Пропустить")
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         "Введите промокод или нажмите 'Пропустить'.",
         reply_markup=markup,
     )
@@ -1271,22 +1311,22 @@ async def promo_entered(message: types.Message, state: FSMContext):
 
     # 1) Пропуск ввода промокода
     if text_raw.lower() in {"пропустить", "skip", "/skip"}:
-        await ui_update(user_id, "Ок, пропускаем ввод промокода.", reply_markup=types.ReplyKeyboardRemove())
+        await ui_send_new(user_id, "Ок, пропускаем ввод промокода.", reply_markup=types.ReplyKeyboardRemove())
         data = get_user_data_entry(user_id)
         used_promos = data.setdefault('used_promos', [])
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             "Перейдите по ссылке для оплаты тарифа PRO.",
             reply_markup=types.ReplyKeyboardRemove(),
         )
         payment_id, url = create_pro_payment(user_id)
         if not payment_id:
-            await ui_update(user_id, "Не удалось создать платёж. Попробуйте позже.")
+            await ui_send_new(user_id, "Не удалось создать платёж. Попробуйте позже.")
         else:
             data['payment_id'] = payment_id
             save_user_data(user_data)
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
-            await ui_update(user_id, "Нажмите кнопку для оплаты.", reply_markup=kb)
+            await ui_send_new(user_id, "Нажмите кнопку для оплаты.", reply_markup=kb)
             asyncio.create_task(
                 wait_payment_and_activate(user_id, payment_id, data.get('chat_limit', CHAT_LIMIT))
             )
@@ -1298,11 +1338,11 @@ async def promo_entered(message: types.Message, state: FSMContext):
 
     # 2) Проверка уже использованных промокодов
     if code in used_promos:
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             t('promo_already_used'),
             reply_markup=types.ReplyKeyboardRemove(),
         )
-        await ui_update(user_id, 'Введите промокод или нажмите "Пропустить".')
+        await ui_send_new(user_id, 'Введите промокод или нажмите "Пропустить".')
         return  # остаёмся в том же стейте
 
     # 3) Обработка демо-промокода
@@ -1311,38 +1351,38 @@ async def promo_entered(message: types.Message, state: FSMContext):
         data['subscription_expiry'] = expiry
         used_promos.append(code)
         save_user_data(user_data)
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             "Промокод принят! Вам предоставлено 7 дней бесплатного тарифа PRO.",
             reply_markup=types.ReplyKeyboardRemove(),
         )
         await state.finish()
-        await ui_update(user_id, "Используйте /login для авторизации.")
+        await ui_send_new(user_id, "Используйте /login для авторизации.")
         return
 
     # 4) Если промокод неизвестный (добавляйте платные коды в known_codes)
     known_codes = {'DEMO'}
     if code not in known_codes:
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             "Неверный промокод.",
             reply_markup=types.ReplyKeyboardRemove(),
         )
-        await ui_update(user_id, 'Введите промокод или нажмите "Пропустить".')
+        await ui_send_new(user_id, 'Введите промокод или нажмите "Пропустить".')
         return  # остаёмся в том же стейте
 
     # 5) Ветка для платных промокодов (пример; сейчас недостижима при known_codes == {'DEMO'})
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         "Перейдите по ссылке для оплаты тарифа PRO.",
         reply_markup=types.ReplyKeyboardRemove(),
     )
     payment_id, url = create_pro_payment(user_id)
     if not payment_id:
-        await ui_update(user_id, "Не удалось создать платёж. Попробуйте позже.")
+        await ui_send_new(user_id, "Не удалось создать платёж. Попробуйте позже.")
     else:
         data['payment_id'] = payment_id
         save_user_data(user_data)
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("Оплатить сейчас", url=url))
-        await ui_update(user_id, "Нажмите кнопку для оплаты.", reply_markup=kb)
+        await ui_send_new(user_id, "Нажмите кнопку для оплаты.", reply_markup=kb)
         asyncio.create_task(
             wait_payment_and_activate(user_id, payment_id, data.get('chat_limit', CHAT_LIMIT))
         )
@@ -1446,7 +1486,7 @@ async def cmd_check_payment(message: types.Message):
     data = get_user_data_entry(user_id)
     payment_id = data.get('payment_id')
     if not payment_id:
-        await ui_update(user_id, "Платёж не найден.")
+        await ui_send_new(user_id, "Платёж не найден.")
         return
     status = check_payment(payment_id)
     if status == 'succeeded':
@@ -1454,9 +1494,9 @@ async def cmd_check_payment(message: types.Message):
         data['subscription_expiry'] = expiry
         data.pop('payment_id', None)
         save_user_data(user_data)
-        await ui_update(user_id, t('payment_success'))
+        await ui_send_new(user_id, t('payment_success'))
     else:
-        await ui_update(user_id, t('payment_failed', status=status))
+        await ui_send_new(user_id, t('payment_failed', status=status))
 
 
 async def send_all_results(user_id: int):
@@ -1579,10 +1619,10 @@ async def cb_edit_tariff(call: types.CallbackQuery, state: FSMContext):
 async def get_parser_name(message: types.Message, state: FSMContext):
     name = message.text.strip()
     if not name:
-        await ui_update(message.from_user.id, "Название не может быть пустым. Попробуйте ещё раз:")
+        await ui_send_new(message.from_user.id, "Название не может быть пустым. Попробуйте ещё раз:")
         return
     await state.update_data(parser_name=name)
-    await ui_update(message.from_user.id,
+    await ui_send_new(message.from_user.id,
         "Укажите ссылки на чаты или каналы (через пробел или запятую):"
     )
     await ParserStates.waiting_chats.set()
@@ -1596,18 +1636,18 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     if not info:
         saved = user_data.get(str(user_id))
         if not saved:
-            await ui_update(user_id, "Сначала авторизуйтесь командой /login")
+            await ui_send_new(user_id, "Сначала авторизуйтесь командой /login")
             return
         api_id = saved.get('api_id')
         api_hash = saved.get('api_hash')
         if not api_id or not api_hash:
-            await ui_update(user_id, "Сначала авторизуйтесь командой /login")
+            await ui_send_new(user_id, "Сначала авторизуйтесь командой /login")
             return
         session_name = f"session_{user_id}"
         client = TelegramClient(session_name, api_id, api_hash)
         await client.connect()
         if not await client.is_user_authorized():
-            await ui_update(user_id, "Сессия найдена, но требует входа. Используйте /login")
+            await ui_send_new(user_id, "Сессия найдена, но требует входа. Используйте /login")
             return
         user_clients[user_id] = {
             'client': client,
@@ -1637,7 +1677,7 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     # user_clients and persistent user_data reference the same list.
     info['parsers'] = parsers
     save_user_data(user_data)
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         parser_info_text(user_id, parser, created=True),
         reply_markup=parser_settings_keyboard(parser_id),
     )
@@ -1651,7 +1691,7 @@ async def start_login(message: types.Message, state: FSMContext):
     data = user_data.get(str(user_id))
     now = int(datetime.utcnow().timestamp())
     if not data or data.get('subscription_expiry', 0) <= now:
-        await ui_update(user_id, "Сначала оплатите тариф командой /tariff_pro")
+        await ui_send_new(user_id, "Сначала оплатите тариф командой /tariff_pro")
         return
     existing = user_clients.pop(user_id, None)
     if existing:
@@ -1679,12 +1719,12 @@ async def start_login(message: types.Message, state: FSMContext):
                 for p in user_clients[user_id]['parsers']:
                     await start_monitor(user_id, p)
                 if user_clients[user_id]['parsers']:
-                    await ui_update(user_id, "✅ Найдены сохранённые парсеры. Мониторинг запущен.")
+                    await ui_send_new(user_id, "✅ Найдены сохранённые парсеры. Мониторинг запущен.")
                     return
-        await ui_update(user_id, "👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:",
+        await ui_send_new(user_id, "👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:",
                              parse_mode="Markdown")
     else:
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             "👋 Привет! Для начала работы введите свой *api_id* Telegram:",
             parse_mode="Markdown"
         )
@@ -1695,10 +1735,10 @@ async def start_login(message: types.Message, state: FSMContext):
 async def get_api_id(message: types.Message, state: FSMContext):
     text = message.text.strip()
     if not text.isdigit():
-        await ui_update(message.from_user.id, "❗ *api_id* должен быть числом. Попробуйте ещё раз:", parse_mode="Markdown")
+        await ui_send_new(message.from_user.id, "❗ *api_id* должен быть числом. Попробуйте ещё раз:", parse_mode="Markdown")
         return
     await state.update_data(api_id=int(text))
-    await ui_update(message.from_user.id, "Отлично. Введите *api_hash* вашего приложения:", parse_mode="Markdown")
+    await ui_send_new(message.from_user.id, "Отлично. Введите *api_hash* вашего приложения:", parse_mode="Markdown")
     await AuthStates.waiting_api_hash.set()
 
 
@@ -1706,10 +1746,10 @@ async def get_api_id(message: types.Message, state: FSMContext):
 async def get_api_hash(message: types.Message, state: FSMContext):
     api_hash = message.text.strip()
     if not api_hash or len(api_hash) < 5:
-        await ui_update(message.from_user.id, "❗ *api_hash* должен быть корректной строкой. Попробуйте ещё раз:", parse_mode="Markdown")
+        await ui_send_new(message.from_user.id, "❗ *api_hash* должен быть корректной строкой. Попробуйте ещё раз:", parse_mode="Markdown")
         return
     await state.update_data(api_hash=api_hash)
-    await ui_update(message.from_user.id,
+    await ui_send_new(message.from_user.id,
         "Теперь введите номер телефона Telegram (с международным кодом, например +79991234567):"
     )
     await AuthStates.waiting_phone.set()
@@ -1733,7 +1773,7 @@ async def get_phone(message: types.Message, state: FSMContext):
     if not normalized.startswith("+"):
         normalized = "+" + normalized
     if not normalized[1:].isdigit():
-        await ui_update(user_id, "❌ Похоже, номер указан неверно. Укажите номер в формате +1234567890")
+        await ui_send_new(user_id, "❌ Похоже, номер указан неверно. Укажите номер в формате +1234567890")
         return
 
     client = TelegramClient(session_name, api_id, api_hash)
@@ -1741,7 +1781,7 @@ async def get_phone(message: types.Message, state: FSMContext):
         await client.connect()
     except Exception as e:
         logging.exception(e)
-        await ui_update(user_id, f"⚠️ Не удалось подключиться к Telegram: {e}")
+        await ui_send_new(user_id, f"⚠️ Не удалось подключиться к Telegram: {e}")
         # не просим номер — просто сообщаем и выходим; пользователь может повторить отправку того же номера
         return
 
@@ -1755,18 +1795,18 @@ async def get_phone(message: types.Message, state: FSMContext):
             phone_hash = result.phone_code_hash
             break
         except PhoneNumberInvalidError:
-            await ui_update(user_id, "❌ Неверный номер телефона. Введите номер заново (например, +1234567890).")
+            await ui_send_new(user_id, "❌ Неверный номер телефона. Введите номер заново (например, +1234567890).")
             await client.disconnect()
             return
         except FloodWaitError as e:
             last_error = e
-            await ui_update(user_id, f"⏳ Telegram просит подождать {e.seconds} сек. Запрашиваю код повторно автоматически...")
+            await ui_send_new(user_id, f"⏳ Telegram просит подождать {e.seconds} сек. Запрашиваю код повторно автоматически...")
             await asyncio.sleep(e.seconds)
             continue
         except Exception as e:
             last_error = e
             delay = RETRY_BASE_DELAY ** attempt
-            await ui_update(user_id,
+            await ui_send_new(user_id,
                 f"⚠️ Ошибка при запросе кода (попытка {attempt}/{RETRY_ATTEMPTS}): {e}\n"
                 f"Пробую ещё раз через {delay} сек..."
             )
@@ -1781,7 +1821,7 @@ async def get_phone(message: types.Message, state: FSMContext):
             detail = f" Подождите {last_error.seconds} сек и попробуйте ещё раз."
         elif last_error:
             detail = f" Детали: {last_error}"
-        await ui_update(user_id, "🚧 Не удалось запросить код подтверждения у Telegram." + detail)
+        await ui_send_new(user_id, "🚧 Не удалось запросить код подтверждения у Telegram." + detail)
         return
 
     # успех: сохраняем клиента и hash, переводим на ввод кода
@@ -1811,7 +1851,7 @@ async def get_phone(message: types.Message, state: FSMContext):
     # кладем в FSM ещё и phone_hash — пригодится в состоянии waiting_code
     await state.update_data(phone=normalized, phone_hash=phone_hash)
 
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         "📱 Код отправлен! Введите код подтверждения (можно с пробелами или дефисами — я их удалю).",
         parse_mode="Markdown"
     )
@@ -1827,7 +1867,7 @@ async def get_code(message: types.Message, state: FSMContext):
     client_info = user_clients.get(user_id)
 
     if not client_info:
-        await ui_update(user_id, "⚠️ Сессия не найдена. Начните сначала /start.")
+        await ui_send_new(user_id, "⚠️ Сессия не найдена. Начните сначала /start.")
         await state.finish()
         return
 
@@ -1838,25 +1878,25 @@ async def get_code(message: types.Message, state: FSMContext):
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_hash)
     except PhoneCodeInvalidError:
-        await ui_update(user_id, "❌ Неверный код. Попробуйте снова, вставив символы между цифрами:")
+        await ui_send_new(user_id, "❌ Неверный код. Попробуйте снова, вставив символы между цифрами:")
         return
     except PhoneCodeExpiredError:
-        await ui_update(user_id,
+        await ui_send_new(user_id,
             "❌ Код истёк. Пожалуйста, перезапустите авторизацию командой /start и запросите новый код."
         )
         await state.finish()
         return
     except SessionPasswordNeededError:
-        await ui_update(user_id, "🔒 Ваш аккаунт защищён паролем. Введите пароль:")
+        await ui_send_new(user_id, "🔒 Ваш аккаунт защищён паролем. Введите пароль:")
         await AuthStates.waiting_password.set()
         return
     except Exception as e:
         logging.exception(e)
-        await ui_update(user_id, f"⚠️ Ошибка при входе: {e}. Попробуйте /start.")
+        await ui_send_new(user_id, f"⚠️ Ошибка при входе: {e}. Попробуйте /start.")
         await state.finish()
         return
 
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         "✅ Вы успешно вошли! Теперь укажите *ссылки* на чаты или каналы для мониторинга."
         " Примеры: `https://t.me/username` или `t.me/username`. Через пробел или запятую:",
         parse_mode="Markdown"
@@ -1871,7 +1911,7 @@ async def get_password(message: types.Message, state: FSMContext):
     client_info = user_clients.get(user_id)
 
     if not client_info:
-        await ui_update(user_id, "⚠️ Сессия не найдена. Начните сначала /start.")
+        await ui_send_new(user_id, "⚠️ Сессия не найдена. Начните сначала /start.")
         await state.finish()
         return
 
@@ -1880,10 +1920,10 @@ async def get_password(message: types.Message, state: FSMContext):
         await client.sign_in(password=password)
     except Exception as e:
         logging.exception(e)
-        await ui_update(user_id, "❌ Неверный пароль. Попробуйте ещё раз:")
+        await ui_send_new(user_id, "❌ Неверный пароль. Попробуйте ещё раз:")
         return
 
-    await ui_update(user_id,
+    await ui_send_new(user_id,
         "✅ Пароль принят! Теперь укажите *ссылки* на чаты или каналы для мониторинга (через пробел или запятую):",
         parse_mode="Markdown"
     )
@@ -1905,21 +1945,21 @@ async def _process_chats(message: types.Message, state: FSMContext, next_state):
             if part.lstrip("-").isdigit():
                 chat_ids.append(int(part))
             else:
-                await ui_update(user_id,
+                await ui_send_new(user_id,
                     "⚠️ Чат не найден. Проверьте доступность в аккаунте и корректность ссылки.")
                 return None
 
     if not chat_ids:
-        await ui_update(user_id, "⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
+        await ui_send_new(user_id, "⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
         return None
 
     limit = get_user_data_entry(user_id).get('chat_limit', CHAT_LIMIT)
     if len(chat_ids) > limit:
-        await ui_update(user_id, f"⚠️ Можно указать не более {limit} чатов.")
+        await ui_send_new(user_id, f"⚠️ Можно указать не более {limit} чатов.")
         return None
 
     await state.update_data(chat_ids=chat_ids)
-    await ui_update(user_id, "Отлично! Теперь введите ключевые слова для мониторинга (через запятую):")
+    await ui_send_new(user_id, "Отлично! Теперь введите ключевые слова для мониторинга (через запятую):")
     await next_state.set()
     return chat_ids
 
@@ -1937,14 +1977,14 @@ async def get_chats_parser(message: types.Message, state: FSMContext):
 async def _process_keywords(message: types.Message, state: FSMContext):
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
     if not keywords:
-        await ui_update(message.from_user.id, "⚠️ Список пуст. Введите хотя бы одно слово:")
+        await ui_send_new(message.from_user.id, "⚠️ Список пуст. Введите хотя бы одно слово:")
         return
 
     user_id = message.from_user.id
     data = await state.get_data()
     chat_ids = data.get('chat_ids')
     if not chat_ids:
-        await ui_update(message.from_user.id, "⚠️ Сначала укажите чаты.")
+        await ui_send_new(message.from_user.id, "⚠️ Сначала укажите чаты.")
         return
 
     await state.update_data(keywords=keywords)
@@ -1976,8 +2016,8 @@ async def _process_keywords(message: types.Message, state: FSMContext):
 
     await start_monitor(user_id, parser)
 
-    await ui_update(message.from_user.id, "✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
-    await ui_update(message.from_user.id, t('menu_main'), reply_markup=main_menu_keyboard())
+    await ui_send_new(message.from_user.id, "✅ Мониторинг запущен! Я уведомлю вас о совпадениях.")
+    await ui_send_new(message.from_user.id, t('menu_main'), reply_markup=main_menu_keyboard())
     await state.finish()
 
 
@@ -2008,15 +2048,15 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
             if part.lstrip("-").isdigit():
                 chat_ids.append(int(part))
             else:
-                await ui_update(user_id, "⚠️ Чат не найден. Проверьте доступность и корректность ссылки.")
+                await ui_send_new(user_id, "⚠️ Чат не найден. Проверьте доступность и корректность ссылки.")
                 return
     if not chat_ids:
-        await ui_update(user_id, "⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
+        await ui_send_new(user_id, "⚠️ Пустой список. Введите хотя бы одну ссылку или ID:")
         return
 
     limit = get_user_data_entry(user_id).get('chat_limit', CHAT_LIMIT)
     if len(chat_ids) > limit:
-        await ui_update(user_id, f"⚠️ Можно указать не более {limit} чатов.")
+        await ui_send_new(user_id, f"⚠️ Можно указать не более {limit} чатов.")
         return
     parser = user_data[str(user_id)]['parsers'][idx]
     stop_monitor(user_id, parser)
@@ -2025,7 +2065,7 @@ async def edit_chats_handler(message: types.Message, state: FSMContext):
     parser['daily_price'] = calc_parser_daily_cost(parser)
     await start_monitor(user_id, parser)
     await state.finish()
-    await ui_update(user_id, "✅ Чаты обновлены.")
+    await ui_send_new(user_id, "✅ Чаты обновлены.")
 
 
 @dp.message_handler(state=EditParserStates.waiting_keywords)
@@ -2034,7 +2074,7 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
     idx = data.get('edit_idx')
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
     if not keywords:
-        await ui_update(message.from_user.id, "⚠️ Список пуст. Введите хотя бы одно слово:")
+        await ui_send_new(message.from_user.id, "⚠️ Список пуст. Введите хотя бы одно слово:")
         return
     user_id = message.from_user.id
     parser = user_data[str(user_id)]['parsers'][idx]
@@ -2044,7 +2084,7 @@ async def edit_keywords_handler(message: types.Message, state: FSMContext):
     await start_monitor(user_id, parser)
     parser['daily_price'] = calc_parser_daily_cost(parser)
     await state.finish()
-    await ui_update(message.from_user.id, "✅ Ключевые слова обновлены.")
+    await ui_send_new(message.from_user.id, "✅ Ключевые слова обновлены.")
 
 
 @dp.message_handler(state=EditParserStates.waiting_exclude)
@@ -2061,7 +2101,7 @@ async def edit_exclude_handler(message: types.Message, state: FSMContext):
     parser['daily_price'] = calc_parser_daily_cost(parser)
 
     await state.finish()
-    await ui_update(message.from_user.id, "✅ Исключающие слова обновлены.")
+    await ui_send_new(message.from_user.id, "✅ Исключающие слова обновлены.")
 
 
 @dp.message_handler(state=EditParserStates.waiting_name)
@@ -2074,7 +2114,7 @@ async def edit_name_handler(message: types.Message, state: FSMContext):
     parser['name'] = new_name
     save_user_data(user_data)
     await state.finish()
-    await ui_update(message.from_user.id, "✅ Название обновлено.")
+    await ui_send_new(message.from_user.id, "✅ Название обновлено.")
 
 
 if __name__ == '__main__':
