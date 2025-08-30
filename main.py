@@ -1279,7 +1279,7 @@ async def _process_tariff_pro(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     data = get_user_data_entry(user_id)
     if data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
-        await cmd_add_parser(message, state)
+        await ui_send_new(user_id, "Подписка уже активна.")
         return
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -1295,11 +1295,6 @@ async def _process_tariff_pro(message: types.Message, state: FSMContext):
 async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
     await _process_tariff_pro(call.message, state)
     await call.answer()
-
-
-@dp.message_handler(commands=['tariff_pro'])
-async def cmd_tariff_pro(message: types.Message, state: FSMContext):
-    await _process_tariff_pro(message, state)
 
 
 
@@ -1356,7 +1351,7 @@ async def promo_entered(message: types.Message, state: FSMContext):
             reply_markup=types.ReplyKeyboardRemove(),
         )
         await state.finish()
-        await ui_send_new(user_id, "Используйте /login для авторизации.")
+        await login_flow(message, state)
         return
 
     # 4) Если промокод неизвестный (добавляйте платные коды в known_codes)
@@ -1632,33 +1627,36 @@ async def get_parser_name(message: types.Message, state: FSMContext):
 async def cmd_add_parser(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
+    data = get_user_data_entry(user_id)
+    now = int(datetime.utcnow().timestamp())
+    if data.get('subscription_expiry', 0) <= now:
+        await _process_tariff_pro(message, state)
+        return
+
     info = user_clients.get(user_id)
     if not info:
         saved = user_data.get(str(user_id))
-        if not saved:
-            await ui_send_new(user_id, "Сначала авторизуйтесь командой /login")
-            return
-        api_id = saved.get('api_id')
-        api_hash = saved.get('api_hash')
+        api_id = saved.get('api_id') if saved else None
+        api_hash = saved.get('api_hash') if saved else None
         if not api_id or not api_hash:
-            await ui_send_new(user_id, "Сначала авторизуйтесь командой /login")
+            await login_flow(message, state)
             return
         session_name = f"session_{user_id}"
         client = TelegramClient(session_name, api_id, api_hash)
         await client.connect()
         if not await client.is_user_authorized():
-            await ui_send_new(user_id, "Сессия найдена, но требует входа. Используйте /login")
+            await login_flow(message, state)
             return
         user_clients[user_id] = {
             'client': client,
-            'phone': saved.get('phone'),
+            'phone': saved.get('phone') if saved else None,
             'phone_hash': '',
-            'parsers': saved.get('parsers', [])
+            'parsers': saved.get('parsers', []) if saved else []
         }
         for p in user_clients[user_id]['parsers']:
             await start_monitor(user_id, p)
+        info = user_clients[user_id]
 
-    data = get_user_data_entry(user_id)
     parsers = data.setdefault('parsers', [])
     parser_id = len(parsers) + 1
     parser = {
@@ -1683,15 +1681,14 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message_handler(commands=['login'], state="*")
-async def start_login(message: types.Message, state: FSMContext):
+async def login_flow(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
     check_subscription(user_id)
     data = user_data.get(str(user_id))
     now = int(datetime.utcnow().timestamp())
     if not data or data.get('subscription_expiry', 0) <= now:
-        await ui_send_new(user_id, "Сначала оплатите тариф командой /tariff_pro")
+        await _process_tariff_pro(message, state)
         return
     existing = user_clients.pop(user_id, None)
     if existing:
