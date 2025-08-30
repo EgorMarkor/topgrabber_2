@@ -3,6 +3,8 @@ import asyncio
 import logging
 import json
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import html
 import csv
 import copy
@@ -31,7 +33,6 @@ from aiogram.utils.exceptions import (
     CantInitiateConversation,
     ChatNotFound,
     BotBlocked,
-    Forbidden,
 )
 
 # Настройка логирования
@@ -97,7 +98,6 @@ async def safe_send_message(
         CantInitiateConversation,
         ChatNotFound,
         BotBlocked,
-        Forbidden,
     ) as e:
         logging.error(f"Cannot send to {user_id}: {e}")
         return None
@@ -1275,27 +1275,39 @@ async def cb_profile_delete_card(call: types.CallbackQuery):
     await call.answer()
 
 
-async def _process_tariff_pro(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
+async def _process_tariff_pro(user_id: int, chat_id: int, state: FSMContext):
     data = get_user_data_entry(user_id)
     if data.get('subscription_expiry', 0) > int(datetime.utcnow().timestamp()):
-        await ui_send_new(user_id, "Подписка уже активна.")
+        await ui_send_new(chat_id, "Подписка уже активна.")  # <- chat_id
         return
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add("Пропустить")
-    await ui_send_new(user_id,
+    await ui_send_new(
+        chat_id,  # <- ВАЖНО: сюда всегда chat_id, не message!
         "Введите промокод или нажмите 'Пропустить'.",
         reply_markup=markup,
     )
     await PromoStates.waiting_promo.set()
 
 
+@dp.message_handler(commands=['tariff_pro'])
+async def cmd_tariff_pro(message: types.Message, state: FSMContext):
+    await _process_tariff_pro(
+        user_id=message.from_user.id,      # для вашей БД
+        chat_id=message.chat.id,           # для отправки сообщений
+        state=state
+    )
+
+
 @dp.callback_query_handler(lambda c: c.data == 'tariff_pro')
 async def cb_tariff_pro(call: types.CallbackQuery, state: FSMContext):
-    await _process_tariff_pro(call.message, state)
+    await _process_tariff_pro(
+        user_id=call.from_user.id,         # кто нажал кнопку
+        chat_id=call.message.chat.id,      # куда отвечать
+        state=state
+    )
     await call.answer()
-
 
 
 @dp.message_handler(state=PromoStates.waiting_promo)
@@ -1622,6 +1634,20 @@ async def get_parser_name(message: types.Message, state: FSMContext):
     )
     await ParserStates.waiting_chats.set()
 
+async def start_tariff_pro_from_message(message: types.Message, state: FSMContext):
+    await _process_tariff_pro(
+        user_id=message.from_user.id,
+        chat_id=message.chat.id,
+        state=state,
+    )
+
+async def start_tariff_pro_from_call(call: types.CallbackQuery, state: FSMContext):
+    await _process_tariff_pro(
+        user_id=call.from_user.id,
+        chat_id=call.message.chat.id,
+        state=state,
+    )
+
 
 @dp.message_handler(commands=['addparser'], state='*')
 async def cmd_add_parser(message: types.Message, state: FSMContext):
@@ -1630,7 +1656,7 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     data = get_user_data_entry(user_id)
     now = int(datetime.utcnow().timestamp())
     if data.get('subscription_expiry', 0) <= now:
-        await _process_tariff_pro(message, state)
+        await start_tariff_pro_from_message(message, state)
         return
 
     info = user_clients.get(user_id)
@@ -1688,7 +1714,7 @@ async def login_flow(message: types.Message, state: FSMContext):
     data = user_data.get(str(user_id))
     now = int(datetime.utcnow().timestamp())
     if not data or data.get('subscription_expiry', 0) <= now:
-        await _process_tariff_pro(message, state)
+        await start_tariff_pro_from_message(message, state)
         return
     existing = user_clients.pop(user_id, None)
     if existing:
