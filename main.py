@@ -81,6 +81,10 @@ async def safe_send_message(
     skipped or failed.
     """
     try:
+        if reply_markup is None:
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+            reply_markup = kb
         chat = await bot.get_chat(user_id)
         is_recipient_bot = getattr(chat, "is_bot", False)
         if is_recipient_bot:
@@ -144,6 +148,10 @@ async def ui_from_callback_edit(
     """Edit message triggered from callback or send a new one on failure."""
     data = get_or_create_user_entry(call.from_user.id)
     try:
+        if reply_markup is None:
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_main"))
+            reply_markup = kb
         m = await call.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except (MessageNotModified, MessageToEditNotFound):
         m = await safe_send_message(
@@ -418,16 +426,16 @@ def check_subscription(user_id: int):
         if not data.get('inactive_notified'):
             # send last results and mark notified
             asyncio.create_task(send_all_results(user_id))
-            asyncio.create_task(bot.send_message(user_id, t('subscription_inactive')))
+            asyncio.create_task(safe_send_message(bot, user_id, t('subscription_inactive')))
             data['inactive_notified'] = True
             save_user_data(user_data)
         return
     if not data.get('recurring'):
         if days_left == 3 and not data.get('reminder3_sent'):
-            asyncio.create_task(bot.send_message(user_id, t('subscription_reminder', days=3)))
+            asyncio.create_task(safe_send_message(bot, user_id, t('subscription_reminder', days=3)))
             data['reminder3_sent'] = True
         elif days_left == 1 and not data.get('reminder1_sent'):
-            asyncio.create_task(bot.send_message(user_id, t('subscription_reminder', days=1)))
+            asyncio.create_task(safe_send_message(bot, user_id, t('subscription_reminder', days=1)))
             data['reminder1_sent'] = True
         if data.get('reminder3_sent') or data.get('reminder1_sent'):
             save_user_data(user_data)
