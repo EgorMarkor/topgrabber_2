@@ -562,10 +562,9 @@ async def resume_parser(user_id: int, parser: dict):
 
 # Определение состояний FSM
 class AuthStates(StatesGroup):
-    waiting_api_id = State()
-    waiting_api_hash = State()
     waiting_phone = State()
-    waiting_code = State()
+    waiting_my_code = State()  # Код для my.telegram.org
+    waiting_telethon_code = State()  # Код для Telethon сессии
     waiting_password = State()
     waiting_chats = State()
     waiting_keywords = State()
@@ -1715,6 +1714,161 @@ async def cmd_add_parser(message: types.Message, state: FSMContext):
     )
 
 
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+import random
+import string
+
+APPS_URL = "https://my.telegram.org/apps"
+AUTH_URL = "https://my.telegram.org/auth"
+
+async def rand_shortname(prefix="myapp"):
+    tail = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{prefix}{tail}"
+
+async def wait_for_single_input(page, input_type="text", timeout=30000):
+    # Возвращает первый видимый input нужного типа
+    locator = page.locator(f"input[type='{input_type}']:visible").first
+    await locator.wait_for(state="visible", timeout=timeout)
+    return locator
+
+def try_regex_parse_api_creds(html_text: str):
+    # оставим как fallback
+    id_match = re.search(r"App\s+api_id[^0-9]*(\d+)", html_text, re.IGNORECASE)
+    if not id_match:
+        id_match = re.search(r"\bapi_id[^0-9]*(\d+)", html_text, re.IGNORECASE)
+    hash_match = re.search(r"App\s+api_hash[^a-f0-9]*([a-f0-9]{32,64})", html_text, re.IGNORECASE)
+    if not hash_match:
+        hash_match = re.search(r"\bapi_hash[^a-f0-9]*([a-f0-9]{32,64})", html_text, re.IGNORECASE)
+    api_id = id_match.group(1) if id_match else None
+    api_hash = hash_match.group(1) if hash_match else None
+    return api_id, api_hash
+
+async def extract_api_creds_on_apps(page, timeout=8000):
+    """ Открывает /apps и достаёт ключи строго из DOM:
+    .form-group:has(label[for='app_id']) → span.form-control → текст (внутри может быть <strong>)
+    .form-group:has(label[for='app_hash']) → span.form-control → текст """
+    await page.goto(APPS_URL)
+    await page.wait_for_load_state("domcontentloaded")
+    # Прямое извлечение по селекторам из вашей вёрстки
+    try:
+        id_span = page.locator(".form-group:has(label[for='app_id']) span.form-control").first
+        hash_span = page.locator(".form-group:has(label[for='app_hash']) span.form-control").first
+        id_text = await id_span.inner_text(timeout=timeout)
+        id_text = id_text.strip()
+        hash_text = await hash_span.inner_text(timeout=timeout)
+        hash_text = hash_text.strip()
+        api_id = re.search(r"\d+", id_text).group(0) if id_text else None
+        api_hash = re.search(r"[a-fA-F0-9]{32,64}", hash_text).group(0) if hash_text else None
+        if api_id and api_hash:
+            return api_id, api_hash
+    except PWTimeout:
+        # блоки не отрисовались — попробуем после «networkidle», потом fallback по HTML
+        await page.wait_for_load_state("networkidle")
+        try:
+            id_span = page.locator(".form-group:has(label[for='app_id']) span.form-control").first
+            hash_span = page.locator(".form-group:has(label[for='app_hash']) span.form-control").first
+            id_text = await id_span.inner_text(timeout=timeout)
+            id_text = id_text.strip()
+            hash_text = await hash_span.inner_text(timeout=timeout)
+            hash_text = hash_text.strip()
+            api_id = re.search(r"\d+", id_text).group(0) if id_text else None
+            api_hash = re.search(r"[a-fA-F0-9]{32,64}", hash_text).group(0) if hash_text else None
+            if api_id and api_hash:
+                return api_id, api_hash
+        except Exception:
+            pass
+    except Exception:
+        pass
+    # Fallback — старый парсинг всем HTML
+    html = await page.content()
+    return try_regex_parse_api_creds(html)
+
+async def create_app_if_missing(page, app_title, short_name, url=None, platform="desktop", desc=""):
+    """ Без изменений логики, но использует новый extract_api_creds_on_apps. """
+    await page.goto(APPS_URL)
+    await page.wait_for_load_state("networkidle")
+    api_id, api_hash = await extract_api_creds_on_apps(page)
+    if api_id and api_hash:
+        return api_id, api_hash
+    # найти и заполнить форму (как было раньше)
+    title_input = page.locator("input[name='app_title']").first
+    shortname_input = page.locator("input[name='app_shortname']").first
+    url_input = page.locator("input[name='app_url']").first
+    platform_select = page.locator("select[name='app_platform']").first
+    desc_textarea = page.locator("textarea[name='app_desc']").first
+    submit_btn = page.locator("button[type='submit'], input[type='submit']").first
+    if not await title_input.is_visible():
+        # возможно, сразу показались креды в другом шаблоне
+        api_id, api_hash = await extract_api_creds_on_apps(page)
+        if api_id and api_hash:
+            return api_id, api_hash
+        raise RuntimeError("Не нашёл форму создания приложения на /apps.")
+    await title_input.fill(app_title)
+    await shortname_input.fill(short_name)
+    if url and await url_input.is_visible():
+        await url_input.fill(url)
+    if await platform_select.is_visible():
+        await platform_select.select_option(platform)
+    if desc and await desc_textarea.is_visible():
+        await desc_textarea.fill(desc)
+    if await submit_btn.is_visible():
+        await submit_btn.click()
+    else:
+        await shortname_input.press("Enter")
+    await page.wait_for_load_state("networkidle")
+    # ещё раз пытаемся извлечь уже выданные креды
+    api_id, api_hash = await extract_api_creds_on_apps(page)
+    if not (api_id and api_hash):
+        await asyncio.sleep(1.5)
+        api_id, api_hash = await extract_api_creds_on_apps(page)
+    if not (api_id and api_hash):
+        raise RuntimeError("Создание прошло, но ключи не нашлись — проверьте вручную /apps.")
+    return api_id, api_hash
+
+async def login_my_telegram(page, phone: str, my_code: str):
+    await page.goto(AUTH_URL)
+    await page.wait_for_load_state("networkidle")
+    # 1) ввод телефона
+    try:
+        phone_input = await wait_for_single_input(page, "text", timeout=30000)
+    except PWTimeout:
+        # иногда поле телефона имеет type=tel
+        phone_input = page.locator("input[type='tel']:visible").first
+        await phone_input.wait_for(state="visible", timeout=30000)
+    await phone_input.fill(phone)
+    await phone_input.press("Enter")
+    # 2) код (из Telegram/SMS)
+    code_input = await wait_for_single_input(page, "text", timeout=180000)
+    await code_input.fill(my_code)
+    await code_input.press("Enter")
+    # 3) 2FA (пароль), если попросит
+    try:
+        pwd_input = page.locator("input[type='password']:visible").first
+        if await pwd_input.is_visible():
+            pwd = await asyncio.get_event_loop().run_in_executor(None, getpass, "Включена 2FA. Введите пароль: ")
+            await pwd_input.fill(pwd)
+            await pwd_input.press("Enter")
+    except PWTimeout:
+        pass
+    # ждём, пока попадём внутрь
+    await page.wait_for_timeout(500)
+    await page.wait_for_load_state("networkidle")
+
+
+async def get_api_creds(phone: str, my_code: str, headless=True):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
+        context = await browser.new_context()
+        page = await context.new_page()
+        await login_my_telegram(page, phone, my_code)
+        shortname = await rand_shortname()
+        api_id, api_hash = await create_app_if_missing(
+            page, app_title="My App", short_name=shortname, platform="desktop"
+        )
+        await context.close()
+        await browser.close()
+        return api_id, api_hash
+
 async def login_flow(message: types.Message, state: FSMContext):
     await state.finish()
     user_id = message.from_user.id
@@ -1752,54 +1906,20 @@ async def login_flow(message: types.Message, state: FSMContext):
                 if user_clients[user_id]['parsers']:
                     await ui_send_new(user_id, "✅ Найдены сохранённые парсеры. Мониторинг запущен.")
                     return
-        await ui_send_new(user_id, "👋 Сессия найдена, но требуется повторный вход. Введите свой *api_id* Telegram:",
-                             parse_mode="Markdown")
+        await ui_send_new(user_id, "👋 Сессия найдена, но требуется повторный вход. Введите номер телефона Telegram (с международным кодом, например +79991234567):")
     else:
         await ui_send_new(user_id,
-            "👋 Привет! Для начала работы введите свой *api_id* Telegram:",
-            parse_mode="Markdown"
+            "👋 Привет! Для начала работы введите номер телефона Telegram (с международным кодом, например +79991234567):",
         )
-    await AuthStates.waiting_api_id.set()
-
-
-@dp.message_handler(state=AuthStates.waiting_api_id)
-async def get_api_id(message: types.Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit():
-        await ui_send_new(message.from_user.id, "❗ *api_id* должен быть числом. Попробуйте ещё раз:", parse_mode="Markdown")
-        return
-    await state.update_data(api_id=int(text))
-    await ui_send_new(message.from_user.id, "Отлично. Введите *api_hash* вашего приложения:", parse_mode="Markdown")
-    await AuthStates.waiting_api_hash.set()
-
-
-@dp.message_handler(state=AuthStates.waiting_api_hash)
-async def get_api_hash(message: types.Message, state: FSMContext):
-    api_hash = message.text.strip()
-    if not api_hash or len(api_hash) < 5:
-        await ui_send_new(message.from_user.id, "❗ *api_hash* должен быть корректной строкой. Попробуйте ещё раз:", parse_mode="Markdown")
-        return
-    await state.update_data(api_hash=api_hash)
-    await ui_send_new(message.from_user.id,
-        "Теперь введите номер телефона Telegram (с международным кодом, например +79991234567):"
-    )
     await AuthStates.waiting_phone.set()
 
-
-
-RETRY_ATTEMPTS = 3          # сколько раз пробуем снова запросить код
-RETRY_BASE_DELAY = 10        # экспоненциальная пауза между попытками: 2, 4, 8...
 
 @dp.message_handler(state=AuthStates.waiting_phone)
 async def get_phone(message: types.Message, state: FSMContext):
     phone = (message.text or "").strip()
-    data = await state.get_data()
-    api_id = data.get('api_id')
-    api_hash = data.get('api_hash')
     user_id = message.from_user.id
-    session_name = f"session_{user_id}"
 
-    # легкая валидация номера (чтобы не дергать Telegram на явном мусоре)
+    # легкая валидация номера
     normalized = phone.replace(" ", "").replace("-", "")
     if not normalized.startswith("+"):
         normalized = "+" + normalized
@@ -1807,118 +1927,90 @@ async def get_phone(message: types.Message, state: FSMContext):
         await ui_send_new(user_id, "❌ Похоже, номер указан неверно. Укажите номер в формате +1234567890")
         return
 
-    client = TelegramClient(session_name, api_id, api_hash)
+    await state.update_data(phone=normalized)
+    await ui_send_new(user_id, "Код отправлен в Telegram/SMS для my.telegram.org. Введите код для my.telegram.org:")
+    await AuthStates.waiting_my_code.set()
+
+
+@dp.message_handler(state=AuthStates.waiting_my_code)
+async def get_my_code(message: types.Message, state: FSMContext):
+    my_code = message.text.strip()
+    user_id = message.from_user.id
+    data = await state.get_data()
+    phone = data.get('phone')
+
     try:
-        await client.connect()
+        api_id, api_hash = await get_api_creds(phone, my_code)
     except Exception as e:
         logging.exception(e)
-        await ui_send_new(user_id, f"⚠️ Не удалось подключиться к Telegram: {e}")
-        # не просим номер — просто сообщаем и выходим; пользователь может повторить отправку того же номера
+        await ui_send_new(user_id, f"⚠️ Ошибка при получении API ключей: {e}. Попробуйте ввести код заново.")
         return
 
-    phone_hash = None
-    last_error = None
-
-    # первая попытка + повторы: всегда пытаемся запросить КОД, а не номер
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            result = await client.send_code_request(normalized)
-            phone_hash = result.phone_code_hash
-            break
-        except PhoneNumberInvalidError:
-            await ui_send_new(user_id, "❌ Неверный номер телефона. Введите номер заново (например, +1234567890).")
-            await client.disconnect()
-            return
-        except FloodWaitError as e:
-            last_error = e
-            await ui_send_new(user_id, f"⏳ Telegram просит подождать {e.seconds} сек. Запрашиваю код повторно автоматически...")
-            await asyncio.sleep(e.seconds)
-            continue
-        except Exception as e:
-            last_error = e
-            delay = RETRY_BASE_DELAY ** attempt
-            await ui_send_new(user_id,
-                f"⚠️ Ошибка при запросе кода (попытка {attempt}/{RETRY_ATTEMPTS}): {e}\n"
-                f"Пробую ещё раз через {delay} сек..."
-            )
-            await asyncio.sleep(delay)
-            continue
-
-    # не получили phone_hash — честно сообщаем и выходим (номер не запрашиваем)
-    if not phone_hash:
-        await client.disconnect()
-        detail = ""
-        if isinstance(last_error, FloodWaitError):
-            detail = f" Подождите {last_error.seconds} сек и попробуйте ещё раз."
-        elif last_error:
-            detail = f" Детали: {last_error}"
-        await ui_send_new(user_id, "🚧 Не удалось запросить код подтверждения у Telegram." + detail)
+    if not api_id or not api_hash:
+        await ui_send_new(user_id, "⚠️ Не удалось получить API ключи. Попробуйте ввести код заново.")
         return
 
-    # успех: сохраняем клиента и hash, переводим на ввод кода
+    # Сохраняем api_id и api_hash
+    saved = user_data.get(str(user_id), {})
+    saved.update({
+        'api_id': int(api_id),
+        'api_hash': api_hash,
+        'phone': phone,
+    })
+    save_user_data(user_data)
+
+    # Теперь создаем Telethon клиент и запрашиваем код для сессии
+    session_name = f"session_{user_id}"
+    client = TelegramClient(session_name, int(api_id), api_hash)
+    await client.connect()
+
+    try:
+        result = await client.send_code_request(phone)
+        phone_hash = result.phone_code_hash
+    except Exception as e:
+        logging.exception(e)
+        await ui_send_new(user_id, f"⚠️ Ошибка при запросе кода для сессии: {e}. Начните сначала /start.")
+        await state.finish()
+        return
+
     user_clients[user_id] = {
         'client': client,
-        'phone': normalized,
+        'phone': phone,
         'phone_hash': phone_hash,
         'parsers': []
     }
 
-    saved = user_data.get(str(user_id), {})
-    saved.update({
-        'api_id': api_id,
-        'api_hash': api_hash,
-        'phone': normalized,
-    })
-    saved.setdefault('parsers', [])
-    saved.setdefault('subscription_expiry', 0)
-    saved.setdefault('recurring', False)
-    saved.setdefault('reminder3_sent', False)
-    saved.setdefault('reminder1_sent', False)
-    saved.setdefault('inactive_notified', False)
-    saved.setdefault('chat_limit', CHAT_LIMIT)
-    user_data[str(user_id)] = saved
-    save_user_data(user_data)
-
-    # кладем в FSM ещё и phone_hash — пригодится в состоянии waiting_code
-    await state.update_data(phone=normalized, phone_hash=phone_hash)
-
-    await ui_send_new(user_id,
-        "📱 Код отправлен! Введите код подтверждения (можно с пробелами или дефисами — я их удалю).",
-        parse_mode="Markdown"
-    )
-    await AuthStates.waiting_code.set()
+    await state.update_data(api_id=int(api_id), api_hash=api_hash, phone_hash=phone_hash)
+    await ui_send_new(user_id, "Код отправлен в Telegram/SMS для создания сессии. Введите код для сессии:")
+    await AuthStates.waiting_telethon_code.set()
 
 
-
-@dp.message_handler(state=AuthStates.waiting_code)
-async def get_code(message: types.Message, state: FSMContext):
+@dp.message_handler(state=AuthStates.waiting_telethon_code)
+async def get_telethon_code(message: types.Message, state: FSMContext):
     raw = message.text.strip()
     code = re.sub(r'\D', '', raw)
     user_id = message.from_user.id
-    client_info = user_clients.get(user_id)
+    data = await state.get_data()
+    api_id = data.get('api_id')
+    api_hash = data.get('api_hash')
+    phone = data.get('phone')
+    phone_hash = data.get('phone_hash')
 
-    if not client_info:
-        await ui_send_new(user_id, "⚠️ Сессия не найдена. Начните сначала /start.")
-        await state.finish()
-        return
-
-    client = client_info['client']
-    phone = client_info['phone']
-    phone_hash = client_info['phone_hash']
+    session_name = f"session_{user_id}"
+    client = TelegramClient(session_name, api_id, api_hash)
+    await client.connect()
 
     try:
         await client.sign_in(phone=phone, code=code, phone_code_hash=phone_hash)
     except PhoneCodeInvalidError:
-        await ui_send_new(user_id, "❌ Неверный код. Попробуйте снова, вставив символы между цифрами:")
+        await ui_send_new(user_id, "❌ Неверный код. Попробуйте снова:")
         return
     except PhoneCodeExpiredError:
-        await ui_send_new(user_id,
-            "❌ Код истёк. Пожалуйста, перезапустите авторизацию командой /start и запросите новый код."
-        )
+        await ui_send_new(user_id, "❌ Код истёк. Перезапустите /start.")
         await state.finish()
         return
     except SessionPasswordNeededError:
-        await ui_send_new(user_id, "🔒 Ваш аккаунт защищён паролем. Введите пароль:")
+        await ui_send_new(user_id, "🔒 Аккаунт защищён паролем. Введите пароль:")
         await AuthStates.waiting_password.set()
         return
     except Exception as e:
@@ -1927,9 +2019,15 @@ async def get_code(message: types.Message, state: FSMContext):
         await state.finish()
         return
 
+    user_clients[user_id] = {
+        'client': client,
+        'phone': phone,
+        'phone_hash': '',
+        'parsers': []
+    }
+
     await ui_send_new(user_id,
-        "✅ Вы успешно вошли! Теперь укажите *ссылки* на чаты или каналы для мониторинга."
-        " Примеры: `https://t.me/username` или `t.me/username`. Через пробел или запятую:",
+        "✅ Вы успешно вошли! Теперь укажите *ссылки* на чаты или каналы для мониторинга (через пробел или запятую):",
         parse_mode="Markdown"
     )
     await AuthStates.waiting_chats.set()
@@ -2008,7 +2106,7 @@ async def get_chats_parser(message: types.Message, state: FSMContext):
 async def _process_keywords(message: types.Message, state: FSMContext):
     keywords = [w.strip().lower() for w in message.text.split(',') if w.strip()]
     if not keywords:
-        await ui_send_new(message.from_user.id, "⚠️ Список пуст. Введите хотя бы одно слово:")
+        await ui_send_new(message.from_user.id, "⚠️ Пустой список. Введите хотя бы одно слово:")
         return
 
     user_id = message.from_user.id
